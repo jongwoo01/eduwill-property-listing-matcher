@@ -1,0 +1,4 @@
+interface:
+  display_name: "손님 조건 매물 매칭"
+  short_description: "Google·로컬 Excel 매물장을 만들고 검색·관리합니다"
+  default_prompt: "$maemul-matching으로 Google Sheets나 로컬 Excel 매물장을 준비하고 손님 조건에 맞는 매물을 찾아줘."
