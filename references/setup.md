@@ -1,6 +1,6 @@
 # 매물장 준비
 
-최초 설정과 `profile start-new` 이후에만 이 4단계를 쓴다. 기존 프로필의 검색·수정에는 표시하지 않는다.
+활성 프로필이 없을 때와 사용자가 새 매물장을 원할 때만 이 4단계를 쓴다. 기존 프로필의 검색·수정에는 표시하지 않는다.
 
 ## 매물장 준비 1/4 — 저장 방식
 
@@ -74,14 +74,14 @@ python3 <tool> profile set --name <name> --access local-xlsx \
 
 완료 응답에는 운영 원본 링크 또는 클릭 가능한 절대 파일 경로, 이관 건수, 보류 건수, 다음 검색 요청 예시 하나를 넣는다.
 
-## 새 매물장과 복귀
+## 새 매물장과 전환
 
 ```bash
-python3 <tool> profile start-new
-python3 <tool> profile next-name --base 기본매물장
-python3 <tool> profile cancel-new
+python3 <tool> profile list
 python3 <tool> profile activate --name <기존이름>
 ```
 
-`start-new`는 기존 원본과 프로필을 보존한다. 새 준비 중에는 기존 이름에 `--replace`를 쓰지 않는다. 사용자가
-"초기화"만 말해 범위가 모호할 때만 “기존 매물장은 두고 새 매물장을 준비할까요?”라고 한 번 묻는다.
+- **새 매물장**: 위 4단계를 다시 밟되, 마지막 `profile set`에 **기존에 없는 새 이름**을 쓰고 `--activate`한다.
+  기존 프로필과 원본은 그대로 남는다. 같은 이름에 `--replace`를 쓰는 것은 덮어쓰기이므로 사용자에게 먼저 확인한다.
+- **이전 매물장으로**: `profile activate`로 전환한다. 삭제가 아니다.
+- 사용자가 "초기화"만 말해 범위가 모호할 때만 "기존 매물장은 두고 새 매물장을 준비할까요?"라고 한 번 묻는다.

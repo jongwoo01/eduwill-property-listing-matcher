@@ -40,20 +40,33 @@ class UserExperienceContractTests(unittest.TestCase):
         self.assertIn("[매물장 열기]", ux)
         self.assertIn("사용자가 할 다음 행동", (SKILL_DIR / "references" / "google-sheets-workflow.md").read_text(encoding="utf-8"))
 
-    def test_new_sheet_flow_is_reversible_and_non_destructive(self) -> None:
+    def test_every_request_starts_with_connection_check(self) -> None:
+        skill = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+        google = (SKILL_DIR / "references" / "google-sheets-workflow.md").read_text(encoding="utf-8")
+        self.assertIn("## 매번 먼저 할 일 — 연결 확인", skill)
+        self.assertIn("get_spreadsheet_metadata", skill)
+        self.assertIn("workbook_exists", skill)
+        self.assertIn("get_spreadsheet_metadata", google)
+
+    def test_add_keeps_duplicate_check_and_reread_even_without_confirmation(self) -> None:
+        skill = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+        google = (SKILL_DIR / "references" / "google-sheets-workflow.md").read_text(encoding="utf-8")
+        self.assertIn("번호 중복 검사 → 쓰기 → 재조회 검증", skill)
+        self.assertIn("확인을 생략하라고 해도", google)
+
+    def test_switching_ledgers_is_non_destructive_and_never_deletes_rows(self) -> None:
         skill = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
         setup = (SKILL_DIR / "references" / "setup.md").read_text(encoding="utf-8")
         ux = (SKILL_DIR / "references" / "user-experience.md").read_text(encoding="utf-8")
         tools = (SKILL_DIR / "references" / "tool-usage.md").read_text(encoding="utf-8")
-
-        self.assertIn("새 매물장", skill)
         self.assertIn("profile activate", skill)
-        self.assertIn("profile start-new", setup)
-        self.assertIn("profile cancel-new", setup)
-        self.assertIn("기존 Google 시트와 연결", ux)
+        self.assertIn("행 자체는 남긴다", skill)
+        self.assertIn("## 새 매물장과 전환", setup)
+        self.assertIn("기존 프로필과 원본은 그대로 남는다", setup)
         self.assertIn("이전 매물장으로 돌아가줘", ux)
-        self.assertIn("기존 이름 덮어쓰기 금지", ux)
-        self.assertIn("profile next-name", tools)
+        self.assertIn("행을 지우지 않고", ux)
+        for removed in ("start-new", "cancel-new", "next-name", "local-csv", "init-ledger", "normalize-pair"):
+            self.assertNotIn(removed, skill + setup + ux + tools)
 
     def test_excel_workflow_handles_large_files_without_database_branch(self) -> None:
         excel = (SKILL_DIR / "references" / "excel-workflow.md").read_text(encoding="utf-8")

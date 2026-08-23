@@ -5,13 +5,13 @@ from __future__ import annotations
 
 import argparse
 import csv
-import ctypes
 import fcntl
 import hashlib
 import io
 import json
 import math
 import os
+import re
 import shutil
 import stat
 import sys
@@ -171,29 +171,6 @@ def fsync_directory(path: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
-
-
-def atomic_exchange(first: Path, second: Path) -> bool:
-    """Atomically exchange two paths where the host exposes a native primitive."""
-    library = ctypes.CDLL(None, use_errno=True)
-    first_raw = os.fsencode(first)
-    second_raw = os.fsencode(second)
-    if sys.platform == "darwin" and hasattr(library, "renamex_np"):
-        function = library.renamex_np
-        function.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
-        function.restype = ctypes.c_int
-        result = function(first_raw, second_raw, 0x00000002)  # RENAME_SWAP
-    elif sys.platform.startswith("linux") and hasattr(library, "renameat2"):
-        function = library.renameat2
-        function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
-        function.restype = ctypes.c_int
-        result = function(-100, first_raw, -100, second_raw, 0x00000002)  # AT_FDCWD, RENAME_EXCHANGE
-    else:
-        return False
-    if result != 0:
-        error_number = ctypes.get_errno()
-        raise OSError(error_number, os.strerror(error_number), str(first), str(second))
-    return True
 
 
 def parse_json(raw: str, label: str) -> Any:
@@ -427,236 +404,6 @@ def command_init_workbook(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def read_source_csv(path: Path) -> tuple[list[str], list[dict[str, str]], str]:
-    """Read a UTF-8 CSV without requiring the current standard schema."""
-    if not path.is_file():
-        fail("원본 CSV 파일을 찾을 수 없습니다", path=str(path))
-    content = path.read_bytes()
-    try:
-        text = content.decode("utf-8-sig")
-    except UnicodeDecodeError as exc:
-        fail("원본 CSV가 UTF-8로 읽히지 않습니다", path=str(path), error=str(exc))
-    with io.StringIO(text, newline="") as handle:
-        reader = csv.DictReader(handle)
-        headers = reader.fieldnames or []
-        if not headers or any(not header for header in headers):
-            fail("원본 CSV 헤더가 비어 있습니다", path=str(path))
-        if len(headers) != len(set(headers)):
-            fail("원본 CSV에 중복 헤더가 있습니다", path=str(path), headers=headers)
-        rows: list[dict[str, str]] = []
-        for row_number, raw_row in enumerate(reader, start=2):
-            if None in raw_row:
-                fail("원본 CSV 행의 열 수가 헤더보다 많습니다", path=str(path), row=row_number)
-            rows.append({header: (raw_row.get(header) or "") for header in headers})
-    return headers, rows, hashlib.sha256(content).hexdigest()
-
-
-def require_unique_source_ids(rows: list[dict[str, str]], path: Path) -> None:
-    seen: set[str] = set()
-    for row_number, row in enumerate(rows, start=2):
-        item_id = row.get("번호", "").strip()
-        if not item_id or item_id == "?":
-            fail("원본 번호는 비어 있거나 ?일 수 없습니다", path=str(path), row=row_number)
-        if item_id in seen:
-            fail("원본에 중복 번호가 있습니다", path=str(path), row=row_number, item_id=item_id)
-        seen.add(item_id)
-
-
-def normalize_legacy_status(value: str, warnings: list[dict[str, Any]], item_id: str) -> str:
-    raw = value.strip()
-    aliases = {
-        "": "보류",
-        "?": "보류",
-        "활성": "진행",
-        "접수": "진행",
-        "거래중": "진행",
-        "계약완료": "완료",
-        "거래완료": "완료",
-        "종료": "완료",
-    }
-    normalized = aliases.get(raw, raw)
-    if normalized not in STATUS_VALUES:
-        fail("원본 상태 값을 표준 상태로 바꿀 수 없습니다", item_id=item_id, value=value)
-    if normalized != raw:
-        warnings.append({"item_id": item_id, "field": "상태", "from": value, "to": normalized})
-    return normalized
-
-
-def normalize_legacy_yn(field: str, value: str, warnings: list[dict[str, Any]], item_id: str) -> str:
-    raw = value.strip()
-    aliases = {
-        "": "?",
-        "가능": "Y",
-        "있음": "Y",
-        "예": "Y",
-        "불가": "N",
-        "없음": "N",
-        "아니오": "N",
-    }
-    normalized = aliases.get(raw, raw.upper())
-    if normalized not in YN_UNKNOWN_VALUES:
-        warnings.append({"item_id": item_id, "field": field, "from": value, "to": "?"})
-        return "?"
-    if normalized != raw:
-        warnings.append({"item_id": item_id, "field": field, "from": value, "to": normalized})
-    return normalized
-
-
-def split_legacy_region(value: str) -> tuple[str, str | None]:
-    """Split a legacy combined region into broad region and neighborhood when explicit."""
-    parts = value.strip().split()
-    if len(parts) < 3:
-        return value, None
-    neighborhood = parts[-1]
-    if not neighborhood.endswith(("동", "읍", "면", "리", "가")):
-        return value, None
-    return " ".join(parts[:-1]), neighborhood
-
-
-def standard_row_from_source(
-    source: dict[str, str],
-    columns: list[str],
-    source_aliases: dict[str, str] | None = None,
-) -> dict[str, str]:
-    aliases = source_aliases or {}
-    row = {column: "?" for column in columns}
-    for source_field, value in source.items():
-        target = aliases.get(source_field, source_field)
-        if target in row:
-            row[target] = normalize_input_value(target, value)
-    return row
-
-
-def write_csv_rows_new(path: Path, columns: list[str], rows: list[dict[str, str]], kind: str) -> None:
-    if path.exists():
-        fail("기존 출력 파일을 덮어쓰지 않습니다", path=str(path))
-    validate_rows(rows, kind)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, raw_temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".normalize", dir=path.parent)
-    temporary = Path(raw_temporary)
-    try:
-        os.chmod(temporary, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8-sig", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=columns, lineterminator="\n", extrasaction="raise")
-            writer.writeheader()
-            writer.writerows(rows)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.link(temporary, path)
-        temporary.unlink()
-        fsync_directory(path.parent)
-    except Exception:
-        if temporary.exists():
-            temporary.unlink()
-        raise
-
-
-def command_normalize_pair(args: argparse.Namespace) -> dict[str, Any]:
-    listing_input = resolve_path(args.listing_input)
-    detail_input = resolve_path(args.detail_input)
-    output_dir = resolve_path(args.output_dir)
-    listing_output = output_dir / "매물.csv"
-    detail_output = output_dir / "매물상세.csv"
-
-    if listing_input == detail_input:
-        fail("검색용 원본과 상세 원본은 달라야 합니다")
-    if listing_input in {listing_output, detail_output} or detail_input in {listing_output, detail_output}:
-        fail("원본과 출력 경로는 달라야 합니다", output_dir=str(output_dir))
-    if listing_output.exists() or detail_output.exists():
-        fail(
-            "표준 출력 파일이 이미 있어 덮어쓰지 않습니다",
-            listing=str(listing_output),
-            detail=str(detail_output),
-        )
-
-    listing_headers, source_listings, listing_sha = read_source_csv(listing_input)
-    detail_headers, source_details, detail_sha = read_source_csv(detail_input)
-    require_unique_source_ids(source_listings, listing_input)
-    require_unique_source_ids(source_details, detail_input)
-
-    detail_by_id = {row["번호"].strip(): row for row in source_details}
-    listing_ids = {row["번호"].strip() for row in source_listings}
-    warnings: list[dict[str, Any]] = []
-    normalized_listings: list[dict[str, str]] = []
-
-    for source in source_listings:
-        item_id = source["번호"].strip()
-        row = standard_row_from_source(source, LISTING_COLUMNS)
-        row["번호"] = item_id
-        row["상태"] = normalize_legacy_status(source.get("상태", ""), warnings, item_id)
-        for field in ("반려", "옵션"):
-            row[field] = normalize_legacy_yn(field, source.get(field, ""), warnings, item_id)
-        if is_unknown(row["동네"]):
-            broad_region, neighborhood = split_legacy_region(row["지역"])
-            if neighborhood:
-                row["지역"] = broad_region
-                row["동네"] = neighborhood
-        if is_unknown(row["접수일"]):
-            detail_received = detail_by_id.get(item_id, {}).get("접수일", "").strip()
-            row["접수일"] = normalize_input_value("접수일", detail_received) if detail_received else "?"
-        normalized_listings.append(row)
-
-    normalized_details: list[dict[str, str]] = []
-    all_detail_ids = list(dict.fromkeys([row["번호"].strip() for row in source_details] + [row["번호"].strip() for row in source_listings]))
-    listing_source_by_id = {row["번호"].strip(): row for row in source_listings}
-    for item_id in all_detail_ids:
-        source = detail_by_id.get(item_id, {"번호": item_id})
-        row = standard_row_from_source(source, DETAIL_COLUMNS, DETAIL_SOURCE_ALIASES)
-        row["번호"] = item_id
-        legacy_school_minutes = listing_source_by_id.get(item_id, {}).get("학군(분)", "").strip()
-        if legacy_school_minutes and legacy_school_minutes != "?":
-            preserved = f"기존 학군(분): {legacy_school_minutes}"
-            current = row.get("학군상세", "?").strip()
-            row["학군상세"] = preserved if is_unknown(current) else f"{current}; {preserved}"
-        normalized_details.append(row)
-
-    validate_rows(normalized_listings, "listing")
-    validate_rows(normalized_details, "detail")
-    output_dir.mkdir(parents=True, exist_ok=True)
-    write_csv_rows_new(listing_output, LISTING_COLUMNS, normalized_listings, "listing")
-    try:
-        write_csv_rows_new(detail_output, DETAIL_COLUMNS, normalized_details, "detail")
-    except Exception:
-        # Do not delete a successfully created output because another process may
-        # have replaced it. A new output directory makes retries unambiguous.
-        raise
-
-    listing_summary = validate_rows(normalized_listings, "listing")
-    detail_summary = validate_rows(normalized_details, "detail")
-    orphan_detail_ids = sorted(set(detail_by_id) - listing_ids)
-    unmapped_listing_headers = [header for header in listing_headers if header not in LISTING_COLUMNS and header not in LEGACY_ONLY_FIELDS]
-    unmapped_detail_headers = [header for header in detail_headers if header not in DETAIL_COLUMNS and header not in DETAIL_SOURCE_ALIASES and header != "접수일"]
-    return {
-        "ok": True,
-        "source": {
-            "listing": str(listing_input),
-            "listing_sha256": listing_sha,
-            "detail": str(detail_input),
-            "detail_sha256": detail_sha,
-        },
-        "output": {
-            "listing": str(listing_output),
-            "listing_sha256": sha256_file(listing_output),
-            "detail": str(detail_output),
-            "detail_sha256": sha256_file(detail_output),
-        },
-        "rows": {"listing": listing_summary["rows"], "detail": detail_summary["rows"]},
-        "mapping": {
-            "공시가격(만원)": "공시가격",
-            "매물상세.접수일": "매물.접수일",
-            "학군(분)": "매물상세.학군상세 (원문 보존)",
-            "지역의 명시적 읍면동": "지역 + 동네",
-        },
-        "added_unknown_fields": {
-            "listing": [column for column in LISTING_COLUMNS if column not in listing_headers and column != "접수일"],
-            "detail": [column for column in DETAIL_COLUMNS if column not in detail_headers and column not in DETAIL_SOURCE_ALIASES.values()],
-        },
-        "unmapped_headers": {"listing": unmapped_listing_headers, "detail": unmapped_detail_headers},
-        "orphan_detail_ids": orphan_detail_ids,
-        "warnings": warnings + listing_summary["warnings"] + detail_summary["warnings"],
-    }
-
-
 @contextmanager
 def file_lock(target: Path) -> Iterable[None]:
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -667,182 +414,6 @@ def file_lock(target: Path) -> Iterable[None]:
             yield
         finally:
             fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
-
-
-def write_csv_new(path: Path, columns: list[str]) -> None:
-    if path.exists():
-        fail("기존 파일을 덮어쓰지 않습니다", path=str(path))
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, raw_temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".init", dir=path.parent)
-    temporary = Path(raw_temporary)
-    try:
-        os.chmod(temporary, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8-sig", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=columns, lineterminator="\n")
-            writer.writeheader()
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.link(temporary, path)
-        temporary.unlink()
-        fsync_directory(path.parent)
-    except Exception:
-        if temporary.exists():
-            temporary.unlink()
-        raise
-
-
-def restore_displaced_file(displaced: Path, target: Path, recovery: Path, mode: int) -> None:
-    """Preserve a displaced original and restore a copy to its public path."""
-    os.chmod(displaced, 0o600)
-    os.replace(displaced, recovery)
-    descriptor, raw_restore = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".restore", dir=target.parent)
-    restore = Path(raw_restore)
-    try:
-        with recovery.open("rb") as source, os.fdopen(descriptor, "wb") as destination:
-            shutil.copyfileobj(source, destination)
-            destination.flush()
-            os.fsync(destination.fileno())
-        os.chmod(restore, mode)
-        os.replace(restore, target)
-        fsync_directory(target.parent)
-    except Exception:
-        if restore.exists():
-            restore.unlink()
-        raise
-
-
-def write_csv_atomic(
-    path: Path,
-    columns: list[str],
-    rows: list[dict[str, str]],
-    kind: str,
-    expected_sha: str,
-) -> tuple[str, str]:
-    validate_rows(rows, kind)
-    backup_dir = path.parent / ".maemul-backups"
-    backup_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    backup = backup_dir / f"{path.name}.{timestamp}.bak"
-
-    mode = stat.S_IMODE(path.stat().st_mode)
-    temporary: Path | None = None
-    preserve_temporary = False
-    try:
-        with tempfile.NamedTemporaryFile(
-            "w",
-            encoding="utf-8-sig",
-            newline="",
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as handle:
-            temporary = Path(handle.name)
-            writer = csv.DictWriter(handle, fieldnames=columns, lineterminator="\n", extrasaction="raise")
-            writer.writeheader()
-            writer.writerows(rows)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(temporary, mode)
-        read_csv_table(temporary, kind)
-        if atomic_exchange(temporary, path):
-            displaced_sha = sha256_file(temporary)
-            if displaced_sha != expected_sha:
-                try:
-                    atomic_exchange(temporary, path)
-                except Exception as rollback_error:
-                    recovery = backup_dir / f"{path.name}.{timestamp}.conflict-original"
-                    try:
-                        preserve_temporary = True
-                        restore_displaced_file(temporary, path, recovery, mode)
-                        temporary = None
-                    except Exception as recovery_error:
-                        preserve_temporary = temporary is not None and temporary.exists()
-                        fail(
-                            "충돌 원본 자동 복구에 실패했습니다",
-                            path=str(path),
-                            displaced_path=str(temporary) if preserve_temporary else None,
-                            recovery_path=str(recovery) if recovery.exists() else None,
-                            rollback_error=str(rollback_error),
-                            recovery_error=str(recovery_error),
-                        )
-                    fail(
-                        "파일 충돌을 감지했고 원본을 복원했습니다",
-                        path=str(path),
-                        expected_sha=expected_sha,
-                        actual_sha=displaced_sha,
-                        recovery_path=str(recovery),
-                        rollback_error=str(rollback_error),
-                    )
-                fail(
-                    "파일이 쓰기 직전에 변경되었습니다",
-                    path=str(path),
-                    expected_sha=expected_sha,
-                    actual_sha=displaced_sha,
-                )
-            try:
-                os.chmod(temporary, 0o600)
-                os.replace(temporary, backup)
-            except Exception as backup_error:
-                # The displaced file is still the confirmed original. Restore
-                # it if securing the backup cannot be completed.
-                if temporary.exists():
-                    try:
-                        atomic_exchange(temporary, path)
-                    except Exception as rollback_error:
-                        recovery = backup_dir / f"{path.name}.{timestamp}.backup-failure-original"
-                        try:
-                            preserve_temporary = True
-                            restore_displaced_file(temporary, path, recovery, mode)
-                            temporary = None
-                        except Exception as recovery_error:
-                            preserve_temporary = temporary is not None and temporary.exists()
-                            fail(
-                                "백업 실패 후 원본 자동 복구에 실패했습니다",
-                                path=str(path),
-                                displaced_path=str(temporary) if preserve_temporary else None,
-                                recovery_path=str(recovery) if recovery.exists() else None,
-                                backup_error=str(backup_error),
-                                rollback_error=str(rollback_error),
-                                recovery_error=str(recovery_error),
-                            )
-                        fail(
-                            "백업 실패를 감지했고 원본을 복원했습니다",
-                            path=str(path),
-                            recovery_path=str(recovery),
-                            backup_error=str(backup_error),
-                            rollback_error=str(rollback_error),
-                        )
-                raise
-            temporary = None
-        else:
-            # Portable fallback: recheck immediately before replacement. Native
-            # exchange above provides the stronger compare-and-swap guarantee.
-            require_expected_hash(path, expected_sha)
-            descriptor = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with path.open("rb") as source, os.fdopen(descriptor, "wb") as destination:
-                shutil.copyfileobj(source, destination)
-                destination.flush()
-                os.fsync(destination.fileno())
-            backup_sha = sha256_file(backup)
-            if backup_sha != expected_sha:
-                fail(
-                    "백업 중 원본이 변경되었습니다",
-                    path=str(path),
-                    expected_sha=expected_sha,
-                    actual_sha=backup_sha,
-                    backup=str(backup),
-                )
-            require_expected_hash(path, expected_sha)
-            os.replace(temporary, path)
-            temporary = None
-        fsync_directory(path.parent)
-        fsync_directory(backup_dir)
-    except Exception:
-        if temporary and temporary.exists() and not preserve_temporary:
-            temporary.unlink()
-        raise
-    return str(backup), sha256_file(path)
 
 
 def write_workbook_atomic(
@@ -906,19 +477,6 @@ def empty_profile_store() -> dict[str, Any]:
     return {"version": 1, "active_profile": None, "profiles": {}}
 
 
-def next_profile_name(profiles: dict[str, Any], base: str) -> str:
-    """Return a stable, human-readable profile name without overwriting one."""
-    base = base.strip()
-    if not base:
-        fail("프로필 이름 기준은 비어 있을 수 없습니다")
-    if base not in profiles:
-        return base
-    suffix = 2
-    while f"{base} {suffix}" in profiles:
-        suffix += 1
-    return f"{base} {suffix}"
-
-
 def load_profile_store(path: Path) -> dict[str, Any]:
     if not path.exists():
         return empty_profile_store()
@@ -928,6 +486,12 @@ def load_profile_store(path: Path) -> dict[str, Any]:
         fail("프로필 저장소를 읽을 수 없습니다", path=str(path), error=str(exc))
     if data.get("version") != 1 or not isinstance(data.get("profiles"), dict):
         fail("프로필 저장소 형식이 올바르지 않습니다", path=str(path))
+    # 예전 버전의 '새 매물장 준비' 상태가 남아 있으면 직전 매물장으로 되돌린다.
+    onboarding = data.pop("onboarding", None)
+    if onboarding and not data.get("active_profile"):
+        previous = onboarding.get("previous_active_profile")
+        if previous in data["profiles"]:
+            data["active_profile"] = previous
     return data
 
 
@@ -949,96 +513,43 @@ def write_profile_store(path: Path, data: dict[str, Any]) -> None:
         raise
 
 
+SHEET_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def extract_sheet_id(raw: str) -> str:
+    """Accept a bare Google Sheets ID or a full URL and return the ID."""
+    value = (raw or "").strip()
+    match = re.search(r"/spreadsheets/d/([A-Za-z0-9_-]+)", value)
+    if match:
+        return match.group(1)
+    if not value or not SHEET_ID_PATTERN.match(value):
+        fail("Google 시트 ID 형식이 올바르지 않습니다", value=raw, hint="시트 링크 또는 /d/와 /edit 사이의 ID를 전달하세요")
+    return value
+
+
+def profile_view(profile: dict[str, Any]) -> dict[str, Any]:
+    result = dict(profile)
+    if profile.get("access") == "local-xlsx":
+        result["workbook_exists"] = Path(profile["workbook_path"]).is_file()
+    return result
+
+
 def command_profile(args: argparse.Namespace, store_path: Path) -> dict[str, Any]:
-    if args.profile_action in {"list", "show", "next-name"}:
+    if args.profile_action in {"list", "show"}:
         data = load_profile_store(store_path)
     else:
         with file_lock(store_path):
             data = load_profile_store(store_path)
-            if args.profile_action == "start-new":
-                onboarding = data.get("onboarding")
-                if onboarding:
-                    previous_name = onboarding.get("previous_active_profile")
-                    return {
-                        "ok": True,
-                        "started": False,
-                        "profile_store": str(store_path),
-                        "active_profile": None,
-                        "onboarding": onboarding,
-                        "previous_profile": data["profiles"].get(previous_name),
-                        "profiles_preserved": len(data["profiles"]),
-                    }
-                previous_name = data.get("active_profile")
-                onboarding = {
-                    "mode": "new-ledger",
-                    "previous_active_profile": previous_name,
-                    "started_at": utc_now(),
-                }
-                data["onboarding"] = onboarding
-                data["active_profile"] = None
-                write_profile_store(store_path, data)
-                return {
-                    "ok": True,
-                    "started": True,
-                    "profile_store": str(store_path),
-                    "active_profile": None,
-                    "onboarding": onboarding,
-                    "previous_profile": data["profiles"].get(previous_name),
-                    "profiles_preserved": len(data["profiles"]),
-                }
-            if args.profile_action == "cancel-new":
-                onboarding = data.pop("onboarding", None)
-                if not onboarding:
-                    return {
-                        "ok": True,
-                        "cancelled": False,
-                        "profile_store": str(store_path),
-                        "active_profile": data.get("active_profile"),
-                        "profile": data["profiles"].get(data.get("active_profile")),
-                    }
-                previous_name = onboarding.get("previous_active_profile")
-                restored_name = previous_name if previous_name in data["profiles"] else None
-                data["active_profile"] = restored_name
-                write_profile_store(store_path, data)
-                return {
-                    "ok": True,
-                    "cancelled": True,
-                    "profile_store": str(store_path),
-                    "active_profile": restored_name,
-                    "profile": data["profiles"].get(restored_name),
-                    "profiles_preserved": len(data["profiles"]),
-                }
             if args.profile_action == "set":
-                onboarding = data.get("onboarding")
-                if args.name in data["profiles"]:
-                    if onboarding and onboarding.get("mode") in {"new-sheet", "new-ledger"}:
-                        fail(
-                            "새 매물장 시작 중에는 기존 프로필을 덮어쓰지 않습니다",
-                            name=args.name,
-                            hint="profile next-name으로 새 이름을 만든 뒤 저장하세요",
-                        )
-                    if not args.replace:
-                        fail("같은 이름의 프로필이 이미 있습니다", name=args.name, hint="확인 후 --replace를 사용하세요")
-                previous_name = onboarding.get("previous_active_profile") if onboarding else None
+                if args.name in data["profiles"] and not args.replace:
+                    fail("같은 이름의 프로필이 이미 있습니다", name=args.name, hint="확인 후 --replace를 사용하세요")
                 profile: dict[str, Any] = {
                     "name": args.name,
                     "access": args.access,
                     "label": args.label or args.name,
                     "updated_at": utc_now(),
                 }
-                if args.access == "local-csv":
-                    if not args.listing:
-                        fail("local-csv 프로필에는 --listing이 필요합니다")
-                    listing = resolve_path(args.listing)
-                    read_csv_table(listing, "listing")
-                    profile["listing_path"] = str(listing)
-                    if args.detail:
-                        detail = resolve_path(args.detail)
-                        read_csv_table(detail, "detail")
-                        profile["detail_path"] = str(detail)
-                    else:
-                        profile["detail_path"] = None
-                elif args.access == "local-xlsx":
+                if args.access == "local-xlsx":
                     if not args.workbook:
                         fail("local-xlsx 프로필에는 --workbook이 필요합니다")
                     workbook_path = resolve_path(args.workbook)
@@ -1052,84 +563,58 @@ def command_profile(args: argparse.Namespace, store_path: Path) -> dict[str, Any
                 else:
                     if not args.sheet_id or not args.connector or not args.account:
                         fail("google-sheet 프로필에는 --sheet-id, --connector, --account가 필요합니다")
+                    sheet_id = extract_sheet_id(args.sheet_id)
+                    if args.spreadsheet_url:
+                        url_id = extract_sheet_id(args.spreadsheet_url)
+                        if url_id != sheet_id:
+                            fail("시트 ID와 링크가 서로 다른 시트를 가리킵니다", sheet_id=sheet_id, url_sheet_id=url_id)
                     profile.update(
-                        sheet_id=args.sheet_id,
-                        spreadsheet_url=args.spreadsheet_url or f"https://docs.google.com/spreadsheets/d/{args.sheet_id}/edit",
+                        sheet_id=sheet_id,
+                        spreadsheet_url=f"https://docs.google.com/spreadsheets/d/{sheet_id}/edit",
                         connector=args.connector,
                         account=args.account,
                         listing_sheet=args.listing_sheet,
                         detail_sheet=args.detail_sheet,
                     )
-                if previous_name and previous_name in data["profiles"] and previous_name != args.name:
-                    profile["previous_profile"] = previous_name
                 data["profiles"][args.name] = profile
                 if args.activate or not data.get("active_profile"):
                     data["active_profile"] = args.name
-                if onboarding and data["active_profile"] == args.name:
-                    data.pop("onboarding", None)
                 write_profile_store(store_path, data)
                 return {
                     "ok": True,
                     "profile_store": str(store_path),
                     "profile": profile,
                     "active_profile": data["active_profile"],
-                    "previous_profile": data["profiles"].get(previous_name),
                 }
             if args.profile_action == "activate":
                 if args.name not in data["profiles"]:
                     fail("프로필을 찾을 수 없습니다", name=args.name)
                 data["active_profile"] = args.name
-                cancelled_onboarding = data.pop("onboarding", None)
                 write_profile_store(store_path, data)
-                return {
-                    "ok": True,
-                    "active_profile": args.name,
-                    "profile": data["profiles"][args.name],
-                    "cancelled_onboarding": bool(cancelled_onboarding),
-                }
+                return {"ok": True, "active_profile": args.name, "profile": profile_view(data["profiles"][args.name])}
 
     if args.profile_action == "list":
         return {
             "ok": True,
             "profile_store": str(store_path),
             "active_profile": data.get("active_profile"),
-            "onboarding": data.get("onboarding"),
-            "profiles": list(data["profiles"].values()),
-        }
-
-    if args.profile_action == "next-name":
-        return {
-            "ok": True,
-            "profile_store": str(store_path),
-            "name": next_profile_name(data["profiles"], args.base),
+            "profiles": [profile_view(profile) for profile in data["profiles"].values()],
         }
 
     name = args.name or data.get("active_profile")
     if not name:
-        return {
-            "ok": True,
-            "profile_store": str(store_path),
-            "active_profile": None,
-            "onboarding": data.get("onboarding"),
-            "profile": None,
-        }
+        return {"ok": True, "profile_store": str(store_path), "active_profile": None, "profile": None}
     profile = data["profiles"].get(name)
     if not profile:
         fail("활성 프로필이 저장소에 없습니다", name=name)
-    result = dict(profile)
-    if profile["access"] == "local-csv":
-        result["listing_exists"] = Path(profile["listing_path"]).is_file()
-        detail_path = profile.get("detail_path")
-        result["detail_exists"] = bool(detail_path and Path(detail_path).is_file())
-    elif profile["access"] == "local-xlsx":
-        result["workbook_exists"] = Path(profile["workbook_path"]).is_file()
-    return {
-        "ok": True,
-        "profile_store": str(store_path),
-        "active_profile": name,
-        "onboarding": data.get("onboarding"),
-        "profile": result,
-    }
+    if profile.get("access") not in {"local-xlsx", "google-sheet"}:
+        fail(
+            "지원하지 않는 저장 방식의 프로필입니다",
+            name=name,
+            access=profile.get("access"),
+            hint="Google Sheets 또는 로컬 Excel로 매물장을 다시 연결하세요",
+        )
+    return {"ok": True, "profile_store": str(store_path), "active_profile": name, "profile": profile_view(profile)}
 
 
 def compare_value(raw: str, criterion: dict[str, Any]) -> bool | None:
@@ -1382,8 +867,7 @@ def generated_id(rows: list[dict[str, str]]) -> str:
 
 
 def command_mutation(args: argparse.Namespace) -> dict[str, Any]:
-    raw_target = args.workbook if getattr(args, "workbook", None) else args.file
-    path = resolve_path(raw_target)
+    path = resolve_path(args.workbook)
     with file_lock(path):
         path, sheet_name, rows, _, snapshot_sha = read_command_table(args, "listing")
         if snapshot_sha != args.expected_sha:
@@ -1445,10 +929,7 @@ def command_mutation(args: argparse.Namespace) -> dict[str, Any]:
 
             warnings = []
 
-        if sheet_name:
-            backup, new_hash = write_workbook_atomic(path, sheet_name, LISTING_COLUMNS, rows, "listing", args.expected_sha)
-        else:
-            backup, new_hash = write_csv_atomic(path, LISTING_COLUMNS, rows, "listing", args.expected_sha)
+        backup, new_hash = write_workbook_atomic(path, sheet_name, LISTING_COLUMNS, rows, "listing", args.expected_sha)
         return {
             "ok": True,
             **target_metadata(path, sheet_name),
@@ -1460,8 +941,7 @@ def command_mutation(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def command_detail_upsert(args: argparse.Namespace) -> dict[str, Any]:
-    raw_target = args.workbook if getattr(args, "workbook", None) else args.file
-    path = resolve_path(raw_target)
+    path = resolve_path(args.workbook)
     with file_lock(path):
         path, sheet_name, rows, _, snapshot_sha = read_command_table(args, "detail")
         if snapshot_sha != args.expected_sha:
@@ -1493,10 +973,7 @@ def command_detail_upsert(args: argparse.Namespace) -> dict[str, Any]:
             rows.append(current)
         else:
             rows[index] = current
-        if sheet_name:
-            backup, new_hash = write_workbook_atomic(path, sheet_name, DETAIL_COLUMNS, rows, "detail", args.expected_sha)
-        else:
-            backup, new_hash = write_csv_atomic(path, DETAIL_COLUMNS, rows, "detail", args.expected_sha)
+        backup, new_hash = write_workbook_atomic(path, sheet_name, DETAIL_COLUMNS, rows, "detail", args.expected_sha)
         return {
             "ok": True,
             **target_metadata(path, sheet_name),
@@ -1512,9 +989,15 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     def add_table_target(command_parser: argparse.ArgumentParser) -> None:
+        """Read-only commands accept a local .xlsx workbook or a standard CSV snapshot."""
         target = command_parser.add_mutually_exclusive_group(required=True)
-        target.add_argument("--file", help="Legacy/local CSV path")
+        target.add_argument("--file", help="Standard CSV snapshot path (read-only use)")
         target.add_argument("--workbook", help="Local .xlsx workbook path")
+        command_parser.add_argument("--sheet", help="Workbook sheet name; defaults to 매물 or 매물상세")
+
+    def add_workbook_target(command_parser: argparse.ArgumentParser) -> None:
+        """Mutating commands only write to a local .xlsx workbook."""
+        command_parser.add_argument("--workbook", required=True, help="Local .xlsx workbook path")
         command_parser.add_argument("--sheet", help="Workbook sheet name; defaults to 매물 or 매물상세")
 
     profile = subparsers.add_parser("profile")
@@ -1522,17 +1005,11 @@ def build_parser() -> argparse.ArgumentParser:
     profile_actions.add_parser("list")
     profile_show = profile_actions.add_parser("show")
     profile_show.add_argument("--name")
-    profile_actions.add_parser("start-new")
-    profile_actions.add_parser("cancel-new")
-    profile_next_name = profile_actions.add_parser("next-name")
-    profile_next_name.add_argument("--base", default="기본매물장")
     profile_activate = profile_actions.add_parser("activate")
     profile_activate.add_argument("--name", required=True)
     profile_set = profile_actions.add_parser("set")
     profile_set.add_argument("--name", required=True)
-    profile_set.add_argument("--access", choices=["local-csv", "local-xlsx", "google-sheet"], required=True)
-    profile_set.add_argument("--listing")
-    profile_set.add_argument("--detail")
+    profile_set.add_argument("--access", choices=["local-xlsx", "google-sheet"], required=True)
     profile_set.add_argument("--workbook")
     profile_set.add_argument("--sheet-id")
     profile_set.add_argument("--spreadsheet-url")
@@ -1544,19 +1021,10 @@ def build_parser() -> argparse.ArgumentParser:
     profile_set.add_argument("--activate", action="store_true")
     profile_set.add_argument("--replace", action="store_true")
 
-    init_ledger = subparsers.add_parser("init-ledger")
-    init_ledger.add_argument("--listing", required=True)
-    init_ledger.add_argument("--detail", required=True)
-
     init_workbook = subparsers.add_parser("init-workbook")
     init_workbook.add_argument("--workbook", required=True)
     init_workbook.add_argument("--listing-sheet", default="매물")
     init_workbook.add_argument("--detail-sheet", default="매물상세")
-
-    normalize_pair = subparsers.add_parser("normalize-pair")
-    normalize_pair.add_argument("--listing-input", required=True)
-    normalize_pair.add_argument("--detail-input", required=True)
-    normalize_pair.add_argument("--output-dir", required=True)
 
     validate = subparsers.add_parser("validate")
     add_table_target(validate)
@@ -1576,23 +1044,23 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("--include-hold", action="store_true")
 
     add = subparsers.add_parser("add")
-    add_table_target(add)
+    add_workbook_target(add)
     add.add_argument("--record-json", required=True)
     add.add_argument("--expected-sha", required=True)
 
     update = subparsers.add_parser("update")
-    add_table_target(update)
+    add_workbook_target(update)
     update.add_argument("--id", required=True)
     update.add_argument("--changes-json", required=True)
     update.add_argument("--expected-sha", required=True)
 
     complete = subparsers.add_parser("complete")
-    add_table_target(complete)
+    add_workbook_target(complete)
     complete.add_argument("--id", required=True)
     complete.add_argument("--expected-sha", required=True)
 
     detail = subparsers.add_parser("detail-upsert")
-    add_table_target(detail)
+    add_workbook_target(detail)
     detail.add_argument("--id", required=True)
     detail.add_argument("--changes-json", required=True)
     detail.add_argument("--expected-sha", required=True)
@@ -1603,41 +1071,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     store_path = resolve_path(args.profile_store) if args.profile_store else default_profile_store()
     if args.command == "profile":
         return command_profile(args, store_path)
-    if args.command == "normalize-pair":
-        return command_normalize_pair(args)
     if args.command == "init-workbook":
         return command_init_workbook(args)
-    if args.command == "init-ledger":
-        listing = resolve_path(args.listing)
-        detail = resolve_path(args.detail)
-        if listing == detail:
-            fail("검색용 파일과 상세 파일은 달라야 합니다")
-        listing_exists = listing.exists()
-        detail_exists = detail.exists()
-        if listing_exists and detail_exists:
-            fail("두 파일이 이미 존재하므로 덮어쓰지 않습니다", listing=str(listing), detail=str(detail))
-        if listing_exists:
-            read_csv_table(listing, "listing")
-            write_csv_new(detail, DETAIL_COLUMNS)
-        elif detail_exists:
-            read_csv_table(detail, "detail")
-            write_csv_new(listing, LISTING_COLUMNS)
-        else:
-            write_csv_new(listing, LISTING_COLUMNS)
-            try:
-                write_csv_new(detail, DETAIL_COLUMNS)
-            except Exception:
-                # Preserve the completed listing rather than risk deleting a path
-                # another process may have replaced after creation. Re-running
-                # init-ledger will validate it and create only the missing detail.
-                raise
-        return {
-            "ok": True,
-            "listing": str(listing),
-            "detail": str(detail),
-            "listing_sha256": sha256_file(listing),
-            "detail_sha256": sha256_file(detail),
-        }
     if args.command == "validate":
         path, sheet_name, _, summary, snapshot_sha = read_command_table(args, args.kind)
         return {"ok": True, **target_metadata(path, sheet_name), "kind": args.kind, "sha256": snapshot_sha, **summary}

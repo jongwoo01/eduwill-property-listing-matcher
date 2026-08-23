@@ -1,4 +1,3 @@
-import csv
 import json
 import subprocess
 import sys
@@ -9,30 +8,8 @@ from pathlib import Path
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
 TOOL = SKILL_DIR / "scripts" / "maemul_tool.py"
-
-LEGACY_LISTING_COLUMNS = [
-    "번호", "상태", "종류", "거래", "지역", "단지명", "동호", "매매가(만원)",
-    "보증금(만원)", "월세(만원)", "관리비(만원)", "전용(㎡)", "방수", "욕실", "층", "총층",
-    "향", "준공", "주차(대)", "반려", "옵션", "입주가능", "역도보(분)", "학군(분)",
-]
-
-LEGACY_DETAIL_COLUMNS = [
-    "번호", "소유자", "연락처", "권리관계", "임대차현황", "용도지역", "건폐율·용적률",
-    "시설상태", "비선호시설", "공시가격(만원)", "특약·메모", "접수일", "접수경로",
-]
-
-
-def write_csv(path: Path, columns: list[str], row: dict[str, str]) -> None:
-    with path.open("w", encoding="utf-8-sig", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=columns, lineterminator="\n")
-        writer.writeheader()
-        writer.writerow(row)
-
-
-def read_rows(path: Path) -> tuple[list[str], list[dict[str, str]]]:
-    with path.open(encoding="utf-8-sig", newline="") as handle:
-        reader = csv.DictReader(handle)
-        return reader.fieldnames or [], list(reader)
+SHEET_ID = "1rr3GyCsLuuQJuo9x9kKaM3GKqEI4fp_JIMZDLfscn7k"
+SHEET_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit?gid=0#gid=0"
 
 
 class MaemulToolRegressionTests(unittest.TestCase):
@@ -47,166 +24,119 @@ class MaemulToolRegressionTests(unittest.TestCase):
             self.fail(f"tool failed: {result.stderr}\n{result.stdout}")
         return result
 
-    def set_google_profile(self, store: Path, name: str, sheet_id: str) -> dict[str, object]:
-        result = self.run_tool(
+    def set_google_profile(self, store: Path, name: str, sheet_id: str, **extra: str) -> dict[str, object]:
+        args = [
             "--profile-store", str(store), "profile", "set", "--name", name,
             "--access", "google-sheet", "--sheet-id", sheet_id,
-            "--spreadsheet-url", f"https://docs.google.com/spreadsheets/d/{sheet_id}/edit",
             "--connector", "google-drive", "--account", "user@example.com",
             "--listing-sheet", "매물", "--detail-sheet", "매물상세", "--activate",
-        )
-        return json.loads(result.stdout)
+        ]
+        for key, value in extra.items():
+            args += [f"--{key.replace('_', '-')}", value]
+        return json.loads(self.run_tool(*args).stdout)
 
-    def test_legacy_pair_normalizes_without_overwriting_source(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            source = root / "source"
-            output = root / "output"
-            source.mkdir()
-            listing = source / "매물.csv"
-            detail = source / "매물상세.csv"
-            write_csv(listing, LEGACY_LISTING_COLUMNS, {
-                "번호": "P001", "상태": "진행", "종류": "아파트", "거래": "매매",
-                "지역": "서울 구로구 항동", "단지명": "테스트단지", "동호": "101동 101호",
-                "매매가(만원)": "50000", "보증금(만원)": "", "월세(만원)": "",
-                "관리비(만원)": "20", "전용(㎡)": "84", "방수": "3", "욕실": "2",
-                "층": "10", "총층": "20", "향": "남", "준공": "2020", "주차(대)": "1",
-                "반려": "가능", "옵션": "없음", "입주가능": "협의", "역도보(분)": "8",
-                "학군(분)": "12",
-            })
-            write_csv(detail, LEGACY_DETAIL_COLUMNS, {
-                "번호": "P001", "소유자": "홍길동", "연락처": "010-0000-0000",
-                "권리관계": "?", "임대차현황": "?", "용도지역": "?", "건폐율·용적률": "?",
-                "시설상태": "양호", "비선호시설": "없음", "공시가격(만원)": "30000",
-                "특약·메모": "", "접수일": "2026-08-17", "접수경로": "전화",
-            })
-            listing_before = listing.read_bytes()
-            detail_before = detail.read_bytes()
-
-            self.run_tool(
-                "normalize-pair", "--listing-input", str(listing), "--detail-input", str(detail),
-                "--output-dir", str(output),
-            )
-
-            listing_headers, listing_rows = read_rows(output / "매물.csv")
-            detail_headers, detail_rows = read_rows(output / "매물상세.csv")
-            self.assertEqual(28, len(listing_headers))
-            self.assertEqual(20, len(detail_headers))
-            self.assertEqual("서울 구로구", listing_rows[0]["지역"])
-            self.assertEqual("항동", listing_rows[0]["동네"])
-            self.assertEqual("2026-08-17", listing_rows[0]["접수일"])
-            self.assertEqual("?", listing_rows[0]["초등도보(분)"])
-            self.assertEqual("기존 학군(분): 12", detail_rows[0]["학군상세"])
-            self.assertEqual("30000", detail_rows[0]["공시가격"])
-            self.assertEqual("Y", listing_rows[0]["반려"])
-            self.assertEqual("N", listing_rows[0]["옵션"])
-            self.assertEqual(listing_before, listing.read_bytes())
-            self.assertEqual(detail_before, detail.read_bytes())
-
-            second = self.run_tool(
-                "normalize-pair", "--listing-input", str(listing), "--detail-input", str(detail),
-                "--output-dir", str(output), expect_ok=False,
-            )
-            self.assertNotEqual(0, second.returncode)
-            self.assertIn("덮어쓰지 않습니다", second.stdout)
+    # --- Google 프로필 ---------------------------------------------------
 
     def test_google_profile_persists_operational_sheet_fields(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             store = Path(temporary) / "profiles.json"
-            profile = self.set_google_profile(store, "기본매물장", "sheet123")["profile"]
-            self.assertEqual("sheet123", profile["sheet_id"])
+            profile = self.set_google_profile(store, "기본매물장", SHEET_ID)["profile"]
+            self.assertEqual(SHEET_ID, profile["sheet_id"])
+            self.assertEqual(f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit", profile["spreadsheet_url"])
             self.assertEqual("매물", profile["listing_sheet"])
             self.assertEqual("매물상세", profile["detail_sheet"])
-            shown = self.run_tool("--profile-store", str(store), "profile", "show")
-            self.assertEqual("sheet123", json.loads(shown.stdout)["profile"]["sheet_id"])
+            shown = json.loads(self.run_tool("--profile-store", str(store), "profile", "show").stdout)
+            self.assertEqual(SHEET_ID, shown["profile"]["sheet_id"])
 
-    def test_start_new_preserves_old_profile_and_cancel_restores_it(self) -> None:
+    def test_google_profile_accepts_pasted_link_as_sheet_id(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             store = Path(temporary) / "profiles.json"
-            self.set_google_profile(store, "기본매물장", "sheet-old")
+            profile = self.set_google_profile(store, "링크매물장", SHEET_URL)["profile"]
+            self.assertEqual(SHEET_ID, profile["sheet_id"])
+            self.assertNotIn("/d/https://", profile["spreadsheet_url"])
 
-            started = json.loads(self.run_tool(
-                "--profile-store", str(store), "profile", "start-new",
-            ).stdout)
-            self.assertTrue(started["started"])
-            self.assertIsNone(started["active_profile"])
-            self.assertEqual("기본매물장", started["onboarding"]["previous_active_profile"])
-            self.assertEqual("sheet-old", started["previous_profile"]["sheet_id"])
-
-            resumed = json.loads(self.run_tool(
-                "--profile-store", str(store), "profile", "show",
-            ).stdout)
-            self.assertEqual("new-ledger", resumed["onboarding"]["mode"])
-            self.assertIsNone(resumed["profile"])
-
-            cancelled = json.loads(self.run_tool(
-                "--profile-store", str(store), "profile", "cancel-new",
-            ).stdout)
-            self.assertTrue(cancelled["cancelled"])
-            self.assertEqual("기본매물장", cancelled["active_profile"])
-            self.assertEqual("sheet-old", cancelled["profile"]["sheet_id"])
-
-            listed = json.loads(self.run_tool(
-                "--profile-store", str(store), "profile", "list",
-            ).stdout)
-            self.assertEqual(1, len(listed["profiles"]))
-            self.assertIsNone(listed["onboarding"])
-
-    def test_new_sheet_completion_keeps_old_profile_and_uses_unique_name(self) -> None:
+    def test_google_profile_rejects_mismatched_id_and_link(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             store = Path(temporary) / "profiles.json"
-            self.set_google_profile(store, "기본매물장", "sheet-old")
-            self.run_tool("--profile-store", str(store), "profile", "start-new")
+            result = self.run_tool(
+                "--profile-store", str(store), "profile", "set", "--name", "불일치",
+                "--access", "google-sheet", "--sheet-id", "AAAA_bbbb-1234567890",
+                "--spreadsheet-url", SHEET_URL,
+                "--connector", "google-drive", "--account", "user@example.com",
+                expect_ok=False,
+            )
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("서로 다른 시트", result.stdout)
+            self.assertFalse(store.exists())
 
-            suggested = json.loads(self.run_tool(
-                "--profile-store", str(store), "profile", "next-name", "--base", "기본매물장",
-            ).stdout)
-            self.assertEqual("기본매물장 2", suggested["name"])
+    def test_google_profile_rejects_malformed_sheet_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Path(temporary) / "profiles.json"
+            result = self.run_tool(
+                "--profile-store", str(store), "profile", "set", "--name", "깨진ID",
+                "--access", "google-sheet", "--sheet-id", "이건 아이디가 아님!",
+                "--connector", "google-drive", "--account", "user@example.com",
+                expect_ok=False,
+            )
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("형식이 올바르지 않습니다", result.stdout)
 
-            created = self.set_google_profile(store, suggested["name"], "sheet-new")
-            self.assertEqual("기본매물장 2", created["active_profile"])
-            self.assertEqual("기본매물장", created["profile"]["previous_profile"])
-            self.assertEqual("sheet-old", created["previous_profile"]["sheet_id"])
+    # --- 프로필 전환·보존 ------------------------------------------------
 
-            listed = json.loads(self.run_tool(
-                "--profile-store", str(store), "profile", "list",
-            ).stdout)
-            self.assertEqual(2, len(listed["profiles"]))
-            self.assertIsNone(listed["onboarding"])
+    def test_switching_profiles_keeps_both_and_refuses_silent_overwrite(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Path(temporary) / "profiles.json"
+            self.set_google_profile(store, "기본매물장", SHEET_ID)
+            second = self.set_google_profile(store, "두번째", "1AbCdEfGhIjKlMnOpQrStUvWxYz0123456789abcdef")
+            self.assertEqual("두번째", second["active_profile"])
+
+            overwritten = self.run_tool(
+                "--profile-store", str(store), "profile", "set", "--name", "기본매물장",
+                "--access", "google-sheet", "--sheet-id", "1AbCdEfGhIjKlMnOpQrStUvWxYz0123456789abcdef",
+                "--connector", "google-drive", "--account", "user@example.com",
+                expect_ok=False,
+            )
+            self.assertIn("이미 있습니다", overwritten.stdout)
 
             returned = json.loads(self.run_tool(
                 "--profile-store", str(store), "profile", "activate", "--name", "기본매물장",
             ).stdout)
-            self.assertEqual("sheet-old", returned["profile"]["sheet_id"])
+            self.assertEqual(SHEET_ID, returned["profile"]["sheet_id"])
+            listed = json.loads(self.run_tool("--profile-store", str(store), "profile", "list").stdout)
+            self.assertEqual(2, len(listed["profiles"]))
 
-    def test_start_new_rejects_overwriting_previous_profile_even_with_replace(self) -> None:
+    def test_legacy_interrupted_onboarding_restores_previous_profile(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             store = Path(temporary) / "profiles.json"
-            self.set_google_profile(store, "기본매물장", "sheet-old")
-            self.run_tool("--profile-store", str(store), "profile", "start-new")
+            self.set_google_profile(store, "기본매물장", SHEET_ID)
+            data = json.loads(store.read_text(encoding="utf-8"))
+            data["active_profile"] = None
+            data["onboarding"] = {"mode": "new-ledger", "previous_active_profile": "기본매물장"}
+            store.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
 
-            overwritten = self.run_tool(
-                "--profile-store", str(store), "profile", "set", "--name", "기본매물장",
-                "--access", "google-sheet", "--sheet-id", "sheet-new",
-                "--connector", "google-drive", "--account", "user@example.com",
-                "--replace", "--activate", expect_ok=False,
-            )
-            self.assertNotEqual(0, overwritten.returncode)
-            self.assertIn("기존 프로필을 덮어쓰지 않습니다", overwritten.stdout)
+            shown = json.loads(self.run_tool("--profile-store", str(store), "profile", "show").stdout)
+            self.assertEqual("기본매물장", shown["active_profile"])
+            self.assertNotIn("onboarding", shown)
 
-            restored = json.loads(self.run_tool(
-                "--profile-store", str(store), "profile", "cancel-new",
-            ).stdout)
-            self.assertEqual("sheet-old", restored["profile"]["sheet_id"])
+    def test_legacy_csv_profile_is_reported_as_unsupported(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Path(temporary) / "profiles.json"
+            store.write_text(json.dumps({
+                "version": 1,
+                "active_profile": "옛날",
+                "profiles": {"옛날": {"name": "옛날", "access": "local-csv", "listing_path": "/x/매물.csv"}},
+            }, ensure_ascii=False), encoding="utf-8")
+            result = self.run_tool("--profile-store", str(store), "profile", "show", expect_ok=False)
+            self.assertIn("지원하지 않는 저장 방식", result.stdout)
+
+    # --- 로컬 Excel --------------------------------------------------------
 
     def test_local_excel_profile_search_and_incomplete_chat_batch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             workbook = root / "고객매물장.xlsx"
             store = root / "profiles.json"
-            initialized = json.loads(self.run_tool(
-                "init-workbook", "--workbook", str(workbook),
-            ).stdout)
+            initialized = json.loads(self.run_tool("init-workbook", "--workbook", str(workbook)).stdout)
 
             added = json.loads(self.run_tool(
                 "add", "--workbook", str(workbook),
@@ -251,11 +181,27 @@ class MaemulToolRegressionTests(unittest.TestCase):
                 "--changes-json", json.dumps({"보증금(만원)": 48000}, ensure_ascii=False),
                 "--expected-sha", detailed["sha256"],
             ).stdout)
-            inspected = json.loads(self.run_tool(
-                "inspect", "--workbook", str(workbook), "--id", "P001",
-            ).stdout)
+            inspected = json.loads(self.run_tool("inspect", "--workbook", str(workbook), "--id", "P001").stdout)
             self.assertEqual("48000", inspected["row"]["보증금(만원)"])
             self.assertEqual(updated["sha256"], inspected["sha256"])
+
+            stale = self.run_tool(
+                "complete", "--workbook", str(workbook), "--id", "P001",
+                "--expected-sha", initialized["sha256"], expect_ok=False,
+            )
+            self.assertIn("확인 이후 변경", stale.stdout)
+
+            completed = json.loads(self.run_tool(
+                "complete", "--workbook", str(workbook), "--id", "P001",
+                "--expected-sha", updated["sha256"],
+            ).stdout)
+            self.assertEqual("완료", completed["changed"]["after"]["상태"])
+            after = json.loads(self.run_tool(
+                "search", "--workbook", str(workbook),
+                "--criteria-json", json.dumps(criteria, ensure_ascii=False),
+            ).stdout)
+            self.assertEqual(0, after["matches_count"])
+            self.assertEqual(2, after["validated_rows"])
 
             profile = json.loads(self.run_tool(
                 "--profile-store", str(store), "profile", "set",
@@ -265,10 +211,36 @@ class MaemulToolRegressionTests(unittest.TestCase):
             self.assertEqual("local-xlsx", profile["access"])
             self.assertEqual(str(workbook.resolve()), profile["workbook_path"])
 
-            shown = json.loads(self.run_tool(
-                "--profile-store", str(store), "profile", "show",
-            ).stdout)["profile"]
+            shown = json.loads(self.run_tool("--profile-store", str(store), "profile", "show").stdout)["profile"]
             self.assertTrue(shown["workbook_exists"])
+
+    def test_csv_snapshot_is_read_only(self) -> None:
+        sample = SKILL_DIR / "assets" / "매물장-샘플.csv"
+        searched = json.loads(self.run_tool(
+            "search", "--file", str(sample),
+            "--criteria-json", json.dumps({"hard": [{"field": "거래", "op": "eq", "value": "매매"}], "soft": []}),
+        ).stdout)
+        self.assertEqual(1, searched["matches_count"])  # P001만; P004 보류, P005 완료 제외
+        self.assertEqual(sample.read_bytes(), sample.read_bytes())
+        mutated = self.run_tool("complete", "--file", str(sample), "--id", "P001", "--expected-sha", "x", expect_ok=False)
+        self.assertNotEqual(0, mutated.returncode)
+
+    def test_template_headers_match_tool_schema(self) -> None:
+        import csv
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("maemul_tool", TOOL)
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+
+        def header(name: str) -> list[str]:
+            with (SKILL_DIR / "assets" / name).open(encoding="utf-8-sig", newline="") as handle:
+                return next(csv.reader(handle))
+
+        self.assertEqual(list(module.LISTING_COLUMNS), header("매물장-템플릿.csv"))
+        self.assertEqual(list(module.LISTING_COLUMNS), header("매물장-샘플.csv"))
+        self.assertEqual(list(module.DETAIL_COLUMNS), header("매물상세-템플릿.csv"))
 
 
 if __name__ == "__main__":
