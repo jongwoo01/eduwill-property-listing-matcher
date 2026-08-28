@@ -1,7 +1,7 @@
-# 결정적 로컬 도구
+# 로컬 도구 사용법
 
-`<tool>`은 `<skill-dir>/scripts/maemul_tool.py`다. 명령은 JSON을 출력하고 실패 시 0이 아닌 종료코드를 반환한다.
-쓰기 명령은 로컬 `.xlsx`에만 쓴다. Google 시트의 읽기·쓰기는 연결된 Google Drive 도구가 맡고, 이 도구는 프로필만 관리한다.
+`<tool>`은 `<skill-dir>/scripts/maemul_tool.py`다. 명령은 JSON을 출력하고 실패하면 0이 아닌 종료코드를 반환한다.
+Google 읽기·쓰기는 Google Drive 도구가 맡고 이 CLI는 프로필과 로컬 Excel을 관리한다.
 
 ## 프로필
 
@@ -9,66 +9,59 @@
 python3 <tool> profile show
 python3 <tool> profile list
 python3 <tool> profile activate --name <name>
-```
-
-Google 프로필 — `--sheet-id`에는 ID 또는 시트 링크 전체를 넘겨도 된다. 링크면 ID를 추출하고, `--spreadsheet-url`과
-ID가 다른 시트를 가리키면 저장을 거부한다:
-
-```bash
 python3 <tool> profile set --name <name> --access google-sheet \
-  --sheet-id <id 또는 링크> --connector <connector> --account <account> \
-  --listing-sheet 매물 --detail-sheet 매물상세 --activate
-```
-
-Excel 프로필 — 파일과 두 탭이 실제로 읽히는지 확인한 뒤 저장한다:
-
-```bash
+  --sheet-id <id-or-url> --connector <connector> --account <email> --activate
 python3 <tool> profile set --name <name> --access local-xlsx \
-  --workbook /절대경로/매물장.xlsx --listing-sheet 매물 --detail-sheet 매물상세 --activate
+  --workbook /절대경로/매물장.xlsx --activate
 ```
 
-같은 이름이 이미 있으면 `--replace` 없이는 거부한다. 테스트에서는 최상위 옵션 `--profile-store /tmp/profiles.json`으로
-실제 저장소를 피한다.
+저장소 형식은 version 1이다. 지원되는 프로필의 필수 필드를 검사하며 Excel은 파일·두 탭·헤더까지 검증한다. 같은 이름은
+`--replace` 없이는 거부한다. 격리 테스트는 최상위 `--profile-store /tmp/profiles.json`을 사용한다.
 
-## Excel 생성·검증·검색
+## Excel 생성
 
 ```bash
-python3 <tool> init-workbook --workbook /절대경로/매물장.xlsx
+python3 <tool> create-excel --directory /절대경로/폴더
+python3 <tool> init-workbook --workbook /절대경로/지정이름.xlsx
+```
+
+`create-excel`은 빈 파일 생성·검증·고유 프로필 저장·활성화를 한 번에 수행한다. 기본 이름 충돌은 `-2`, `-3`으로
+피한다. `init-workbook`은 지정 경로에 표준 파일만 만들며 기존 파일을 덮어쓰지 않는다.
+
+## 읽기
+
+```bash
 python3 <tool> validate --workbook /절대경로/매물장.xlsx --kind listing
-python3 <tool> validate --workbook /절대경로/매물장.xlsx --kind detail
 python3 <tool> hash --file /절대경로/매물장.xlsx
-python3 <tool> search --workbook /절대경로/매물장.xlsx \
-  --criteria-json '<JSON>' --limit 10
+python3 <tool> inspect --workbook /절대경로/매물장.xlsx --id P001
+python3 <tool> search --workbook /절대경로/매물장.xlsx --criteria-json '<JSON>' --limit 10
+python3 <tool> search --workbook /절대경로/매물장.xlsx --criteria-json '<JSON>' --include-hold
 ```
 
-다른 탭 이름이면 `--sheet <이름>`을 쓴다. 지원 연산자는 `eq`, `ne`, `in`, `not-in`, `contains`, `lte`, `gte`,
-`between`이다. 출력의 `matches`는 확인된 일치, `needs_verification`은 하드 조건 값이 `?`인 후보,
-`relaxations`는 하드 조건을 하나씩 뺐을 때의 실제 건수다.
+연산자는 `eq`, `ne`, `in`, `not-in`, `contains`, `lte`, `gte`, `between`이다. 텍스트 필드의
+크기 비교와 숫자 필드의 `contains`는 거부한다. `matches`와 `needs_verification`은 별도 집계다. `--include-hold`를
+사용하면 `match_status_counts`와 `verification_status_counts`로 진행·보류 건수를 따로 확인한다.
 
-## Excel 변경과 채팅 일괄 추가
+## 변경
 
 ```bash
-python3 <tool> inspect --workbook /절대경로/매물장.xlsx --id P001
-python3 <tool> add --workbook /절대경로/매물장.xlsx \
-  --record-json '{"종류":"아파트","거래":"전세"}' --expected-sha <sha>
-python3 <tool> add --workbook /절대경로/매물장.xlsx \
-  --record-json '[{"종류":"아파트"},{"거래":"전세","지역":"서울"}]' --expected-sha <sha>
-python3 <tool> update --workbook /절대경로/매물장.xlsx --id P001 \
-  --changes-json '{"보증금(만원)":"48000"}' --expected-sha <sha>
+python3 <tool> add --workbook /절대경로/매물장.xlsx --record-json '<객체-or-배열>' --expected-sha <sha>
+python3 <tool> update --workbook /절대경로/매물장.xlsx --id P001 --changes-json '<객체>' --expected-sha <sha>
 python3 <tool> complete --workbook /절대경로/매물장.xlsx --id P001 --expected-sha <sha>
 python3 <tool> detail-upsert --workbook /절대경로/매물장.xlsx --id P001 \
-  --changes-json '{"특약·메모":"확인 필요"}' --expected-sha <sha>
+  --changes-json '<객체>' --expected-sha <sha>
 ```
 
-`add`는 객체 또는 최대 1,000개 객체 배열을 받는다. `null`은 `?`로 바뀐다. 핵심값이 불완전한 새 행은 자동으로
-`상태=보류`가 되고 `warnings`에 이유가 나온다. `--expected-sha`가 현재 파일과 다르면 쓰지 않는다.
+`add`는 최대 1,000건을 받는다. 불완전한 핵심값은 보류와 경고를 만들고 중복 지문은 저장을 막지 않고 후보만 알린다.
+`update`도 핵심값이 미확인이 되면 보류로 강제한다. `detail-upsert`는 `매물` 탭에 없는 번호를 거부한다.
+거래는 매매·전세·월세·`?`만 허용한다. 쓰기는 요청 셀만 바꾸고 백업 경로와 새 해시를 반환한다.
 
-## CSV 스냅샷(읽기 전용)
+표준 28열 CSV는 `validate --file`과 `search --file`에서 읽기 전용 스냅샷으로만 지원한다.
+
+Google Sheets 추가 전에는 최신 28열 행과 신규 자료를 결정적으로 준비할 수 있다. 이 명령은 시트에 쓰지 않는다.
 
 ```bash
-python3 <tool> validate --file /절대경로/매물.csv --kind listing
-python3 <tool> search --file /절대경로/매물.csv --criteria-json '<JSON>' --limit 10
+python3 <tool> prepare-add --existing-json '<기존 매물 배열>' --record-json '<신규 매물 객체-or-배열>'
 ```
 
-표준 28열 CSV는 읽기 전용으로만 쓴다. Google 시트 행이 많아 순위가 헷갈릴 때 임시 스냅샷으로 내려 순위를
-계산하는 용도다. CSV에 쓰는 명령은 없다.
+반환된 `prepared`의 번호·상태를 그대로 배치 쓰기에 사용하고, `warnings`의 보류·중복 후보를 사용자에게 전달한다.

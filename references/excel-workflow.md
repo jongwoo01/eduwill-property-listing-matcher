@@ -1,16 +1,15 @@
-# 로컬 Excel 흐름
+# 로컬 Excel 운영
 
-사용자가 `local-xlsx`를 선택했을 때만 읽는다. 한 `.xlsx` 파일의 `매물`·`매물상세` 탭이 운영 원본이다.
+로컬 Excel에는 Google Drive 플러그인이나 로그인이 필요 없다. 한 `.xlsx`의 `매물`·`매물상세` 탭이 운영 원본이다.
 
 ## 연결·생성
 
-1. 사용자가 지정한 폴더 또는 파일 경로를 절대 경로로 확인한다.
-2. 새 파일이면 `init-workbook`으로 만들고, 같은 이름이 있으면 덮어쓰지 않는다.
-3. 기존 파일이면 두 탭과 헤더를 `validate --workbook`으로 검증한다.
-4. `profile set --access local-xlsx`로 파일 경로와 탭 이름을 저장한다.
+- 새 빈 매물장: 존재하고 쓰기 가능한 폴더만 받아 `create-excel --directory <절대경로>`를 실행한다. 파일·프로필 이름
+  충돌은 자동 번호로 피한다. 오타 경로를 새 폴더로 자동 생성하지 않는다.
+- 기존 파일: `profile set --access local-xlsx`가 파일 존재, 두 탭과 표준 헤더를 검증한다.
+- 저장된 파일이 이동·삭제됐으면 새 파일을 만들지 말고 새 절대경로를 받는다.
 
-폴더가 이동되거나 파일이 사라지면 새 파일을 자동 생성하지 말고 새 위치를 받는다. 동기화 폴더도 가능하지만 여러 사람이
-동시에 편집한다면 Google Sheets를 안내한다.
+생성은 파일 생성 → 두 탭 검증 → 프로필 저장·활성화 순서다. 중간 실패 시 이전 활성 프로필은 그대로다.
 
 ## 검색
 
@@ -19,36 +18,26 @@ python3 <tool> search --workbook /절대경로/매물장.xlsx \
   --sheet 매물 --criteria-json '<JSON>' --limit 10
 ```
 
-검색은 openpyxl의 읽기 전용 모드로 최신 파일을 한 번 순회한다. 15,000건 이상이어도 전체 행을 대화에 싣지 말고 도구의
-상위 결과와 건수만 사용한다. `상태=완료`, 기본적으로 `보류`를 제외한다. 모든 완화 조건 건수도 같은 행 순회에서 계산한다.
+읽기 전용으로 최신 파일을 순회하고 상위 결과와 집계만 사용한다. 기본적으로 완료·보류는 제외한다.
 
-## 추가·수정·완료
-
-쓰기 전에 `inspect` 또는 `hash`로 대상과 해시를 얻고, 사용자의 확인 뒤 같은 해시를 `--expected-sha`로 전달한다.
+## 변경
 
 ```bash
 python3 <tool> inspect --workbook /절대경로/매물장.xlsx --id P001
-python3 <tool> add --workbook /절대경로/매물장.xlsx \
-  --record-json '<객체 또는 객체 배열>' --expected-sha <sha>
-python3 <tool> update --workbook /절대경로/매물장.xlsx --id P001 \
-  --changes-json '<객체>' --expected-sha <sha>
+python3 <tool> add --workbook /절대경로/매물장.xlsx --record-json '<JSON>' --expected-sha <sha>
+python3 <tool> update --workbook /절대경로/매물장.xlsx --id P001 --changes-json '<JSON>' --expected-sha <sha>
 python3 <tool> complete --workbook /절대경로/매물장.xlsx --id P001 --expected-sha <sha>
-python3 <tool> detail-upsert --workbook /절대경로/매물장.xlsx --id P001 \
-  --changes-json '<객체>' --expected-sha <sha>
+python3 <tool> detail-upsert --workbook /절대경로/매물장.xlsx --id P001 --changes-json '<JSON>' --expected-sha <sha>
 ```
 
-도구는 파일 잠금, 확인 시점 해시, `.maemul-backups` 백업, 임시 파일 교체, 사후 검증을 사용한다. Excel에서 파일이
-열린 채 외부 변경이 생겨 해시가 달라지면 쓰지 말고 다시 읽어 변경안을 갱신한다.
+변경 전 해시와 대상 행을 확인한다. 도구는 잠금, 백업, 해시 재검증, 임시 파일 원자 교체를 수행하며 실제 변경 셀이나
+추가 행만 갱신한다. 다른 셀 값·행 서식·표준 열 밖 수식과 사용자 확장 열은 보존한다. 해시가 달라지면 다시 읽고
+변경안을 갱신한다.
 
-## 채팅 입력
+핵심값이 빠진 추가·수정은 보류 경고를 반환한다. `detail-upsert`는 `매물` 탭에 없는 번호를 거부한다.
 
-한 건은 JSON 객체, 여러 건은 객체 배열로 정규화해 `add`에 전달한다. 없는 값은 생략하거나 `null`로 전달한다. 핵심값이
-빠진 행은 도구가 `보류`로 저장하고 경고를 돌려준다. 사용자에게는 "저장하지 못함"이 아니라 "저장됨, 확인 필요"로 알린다.
+계약 완료와 계약일·실제계약금액 기록을 함께 요청받으면 먼저 두 변경을 하나의 작업으로 확인받는다. `complete` 뒤 반환된 새
+해시로 `detail-upsert`를 실행하고 두 탭을 확인한다. 실제 계약금액을 매물의 호가로 추정하지 않는다. 상세 기록만 실패하면
+완료 처리를 다시 실행하지 말고, 완료 반영과 상세 미반영을 나눠 알린다.
 
-## 대용량 원칙
-
-- Excel 원본 전체를 CSV로 매번 변환하지 않는다.
-- 검색 결과는 기본 10건만 반환한다.
-- 정렬·필터는 결정적 도구에서 수행하고 원본 행 전체를 모델 컨텍스트에 넣지 않는다.
-- 파일 변경은 전체 통합 문서를 저장하므로, 수만 건에서 잦은 동시 수정이 필요하면 Google Sheets가 더 적합하다고 안내한다.
-- SQLite는 대안으로 제시하지 않는다.
+15,000건 이상이어도 원본 전체를 대화에 싣지 않는다. 공유·동시 편집이 잦으면 Google Sheets가 더 적합할 수 있다.
