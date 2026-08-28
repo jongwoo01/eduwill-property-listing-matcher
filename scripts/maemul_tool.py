@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic profile, CSV/XLSX search, and safe mutation tool for maemul-matching."""
+"""Deterministic profile, CSV/XLSX search, and safe mutation tool for edwill-property-listing-matcher."""
 
 from __future__ import annotations
 
@@ -24,12 +24,15 @@ from typing import Any, Iterable
 try:
     from openpyxl import Workbook, load_workbook
     from openpyxl.styles import Font, PatternFill
+    from openpyxl.utils.cell import get_column_letter, range_boundaries
     from openpyxl.worksheet.datavalidation import DataValidation
 except ImportError:  # pragma: no cover - reported at the command boundary
     Workbook = None
     load_workbook = None
     Font = None
     PatternFill = None
+    get_column_letter = None
+    range_boundaries = None
     DataValidation = None
 
 
@@ -108,6 +111,7 @@ NONNEGATIVE_NUMERIC_FIELDS = NUMERIC_FIELDS - {"층"}
 FORMULA_PREFIXES = ("=", "+", "-", "@")
 
 STATUS_VALUES = {"진행", "보류", "완료"}
+TRANSACTION_VALUES = {"매매", "전세", "월세", "?"}
 YN_UNKNOWN_VALUES = {"Y", "N", "?"}
 UNKNOWN_VALUES = {"", "?"}
 SUPPORTED_OPERATORS = {"eq", "ne", "in", "not-in", "contains", "lte", "gte", "between"}
@@ -156,7 +160,11 @@ def require_xlsx_path(path: Path) -> None:
 
 def default_profile_store() -> Path:
     codex_root = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser()
-    return (codex_root / "maemul-matching" / "profiles.json").resolve()
+    canonical = (codex_root / "edwill-property-listing-matcher" / "profiles.json").resolve()
+    legacy = (codex_root / "maemul-matching" / "profiles.json").resolve()
+    if not canonical.exists() and legacy.is_file():
+        write_profile_store(canonical, load_profile_store(legacy))
+    return canonical
 
 
 def sha256_file(path: Path) -> str:
@@ -261,6 +269,8 @@ def validate_rows(rows: list[dict[str, str]], kind: str) -> dict[str, Any]:
         if kind == "listing":
             if row["상태"] not in STATUS_VALUES:
                 fail("상태 값이 올바르지 않습니다", row=index, value=row["상태"])
+            if row["거래"] not in TRANSACTION_VALUES:
+                fail("거래 값이 올바르지 않습니다", row=index, value=row["거래"], allowed=sorted(TRANSACTION_VALUES))
             for field in ("반려", "옵션"):
                 if row[field] not in YN_UNKNOWN_VALUES:
                     fail("Y/N/? 필드 값이 올바르지 않습니다", row=index, field=field, value=row[field])
@@ -270,6 +280,8 @@ def validate_rows(rows: list[dict[str, str]], kind: str) -> dict[str, Any]:
             for required in ("종류", "거래", "지역"):
                 if is_unknown(row[required]):
                     warnings.append({"row": index, "field": required, "warning": "검색 핵심값 미확인"})
+            if any(is_unknown(row[field]) for field in ("종류", "거래", "지역")) and row["상태"] != "보류":
+                fail("검색 핵심값이 미확인인 행은 상태=보류여야 합니다", row=index, item_id=item_id)
         else:
             validate_iso_date(row["계약일"].strip(), "계약일", index)
 
@@ -331,9 +343,10 @@ def read_workbook_snapshot(
             fail("Excel 매물장에 필요한 탭이 없습니다", path=str(path), sheet=sheet_name)
         sheet = workbook[sheet_name]
         expected = LISTING_COLUMNS if kind == "listing" else DETAIL_COLUMNS
-        actual = [workbook_cell_text(cell.value) for cell in next(sheet.iter_rows(min_row=1, max_row=1))]
-        while actual and actual[-1] == "":
-            actual.pop()
+        actual = [
+            workbook_cell_text(cell.value)
+            for cell in next(sheet.iter_rows(min_row=1, max_row=1, max_col=len(expected)))
+        ]
         if actual != expected:
             fail("Excel 탭 헤더가 표준 스키마와 다릅니다", path=str(path), sheet=sheet_name, expected=expected, actual=actual)
         rows: list[dict[str, str]] = []
@@ -345,6 +358,17 @@ def read_workbook_snapshot(
         workbook.close()
     summary = validate_rows(rows, kind)
     return rows, summary, snapshot_sha
+
+
+def validate_workbook_pair(path: Path, listing_sheet: str, detail_sheet: str) -> None:
+    listing_rows, _, listing_sha = read_workbook_snapshot(path, "listing", listing_sheet)
+    detail_rows, _, detail_sha = read_workbook_snapshot(path, "detail", detail_sheet)
+    if listing_sha != detail_sha:
+        fail("Excel 매물장이 검증 중 변경되었습니다", path=str(path))
+    listing_ids = {row["번호"] for row in listing_rows}
+    orphan_ids = sorted(row["번호"] for row in detail_rows if row["번호"] not in listing_ids)
+    if orphan_ids:
+        fail("매물 탭에 없는 번호의 상세행이 있습니다", path=str(path), item_ids=orphan_ids[:20])
 
 
 def style_workbook_sheet(sheet: Any, columns: list[str]) -> None:
@@ -378,11 +402,12 @@ def command_init_workbook(args: argparse.Namespace) -> dict[str, Any]:
     listing.add_data_validation(status_validation)
     listing.add_data_validation(yn_validation)
     status_validation.add("B2:B1048576")
-    yn_validation.add("T2:U1048576")
+    yn_validation.add("U2:V1048576")
 
     descriptor, raw_temporary = tempfile.mkstemp(prefix=f".{path.stem}.", suffix=".xlsx", dir=path.parent)
     os.close(descriptor)
     temporary = Path(raw_temporary)
+    published = False
     try:
         workbook.save(temporary)
         workbook.close()
@@ -390,12 +415,16 @@ def command_init_workbook(args: argparse.Namespace) -> dict[str, Any]:
         read_workbook_snapshot(temporary, "listing", args.listing_sheet)
         read_workbook_snapshot(temporary, "detail", args.detail_sheet)
         os.link(temporary, path)
+        published = True
         temporary.unlink()
         fsync_directory(path.parent)
     except Exception:
         workbook.close()
         if temporary.exists():
             temporary.unlink()
+        if published and path.exists():
+            path.unlink()
+            fsync_directory(path.parent)
         raise
     return {
         "ok": True,
@@ -403,6 +432,69 @@ def command_init_workbook(args: argparse.Namespace) -> dict[str, Any]:
         "listing_sheet": args.listing_sheet,
         "detail_sheet": args.detail_sheet,
         "sha256": sha256_file(path),
+    }
+
+
+def unique_excel_target(directory: Path, base_name: str, profiles: dict[str, Any]) -> tuple[Path, str]:
+    """Choose one suffix that is free for both the workbook and profile name."""
+    raw_base = base_name[:-5] if base_name.casefold().endswith(".xlsx") else base_name
+    raw_base = raw_base.strip()
+    if not raw_base or Path(raw_base).name != raw_base:
+        fail("Excel 기본 이름에는 폴더 경로를 넣을 수 없습니다", base_name=base_name)
+    suffix = 1
+    while True:
+        profile_name = raw_base if suffix == 1 else f"{raw_base}-{suffix}"
+        path = directory / f"{profile_name}.xlsx"
+        if not path.exists() and profile_name not in profiles:
+            return path, profile_name
+        suffix += 1
+
+
+def command_create_excel(args: argparse.Namespace, store_path: Path) -> dict[str, Any]:
+    """Create, validate, register, and activate a new empty Excel ledger."""
+    directory = resolve_path(args.directory)
+    if not directory.is_dir():
+        fail("저장할 기존 폴더를 찾을 수 없습니다", directory=str(directory))
+    if not os.access(directory, os.W_OK):
+        fail("저장할 폴더에 쓰기 권한이 없습니다", directory=str(directory))
+    created_path: Path | None = None
+    with file_lock(store_path):
+        data = load_profile_store(store_path)
+        previous_active = data.get("active_profile")
+        path, profile_name = unique_excel_target(directory, args.base_name, data["profiles"])
+        try:
+            initialized = command_init_workbook(
+                argparse.Namespace(
+                    workbook=str(path),
+                    listing_sheet=args.listing_sheet,
+                    detail_sheet=args.detail_sheet,
+                )
+            )
+            created_path = path
+            validate_workbook_pair(path, args.listing_sheet, args.detail_sheet)
+            profile = {
+                "name": profile_name,
+                "access": "local-xlsx",
+                "label": profile_name,
+                "updated_at": utc_now(),
+                "workbook_path": str(path),
+                "listing_sheet": args.listing_sheet,
+                "detail_sheet": args.detail_sheet,
+            }
+            data["profiles"][profile_name] = profile
+            data["active_profile"] = profile_name
+            write_profile_store(store_path, data)
+        except Exception:
+            if created_path is not None and created_path.exists():
+                created_path.unlink()
+                fsync_directory(created_path.parent)
+            raise
+    return {
+        **initialized,
+        "profile_store": str(store_path),
+        "profile": profile,
+        "active_profile": profile_name,
+        "previous_active_profile": previous_active,
     }
 
 
@@ -425,8 +517,9 @@ def write_workbook_atomic(
     rows: list[dict[str, str]],
     kind: str,
     expected_sha: str,
+    patches: list[dict[str, Any]],
 ) -> tuple[str, str]:
-    """Rewrite one standard tab while preserving the other workbook tabs."""
+    """Apply only requested cell changes in a temporary workbook, then replace atomically."""
     require_openpyxl()
     require_xlsx_path(path)
     validate_rows(rows, kind)
@@ -444,16 +537,53 @@ def write_workbook_atomic(
             if sheet_name not in workbook.sheetnames:
                 fail("Excel 매물장에 필요한 탭이 없습니다", path=str(path), sheet=sheet_name)
             sheet = workbook[sheet_name]
-            if sheet.max_row > 1:
-                sheet.delete_rows(2, sheet.max_row - 1)
-            for row_index, row in enumerate(rows, start=2):
-                for column_index, field in enumerate(columns, start=1):
-                    sheet.cell(row_index, column_index, row[field])
-            sheet.auto_filter.ref = f"A1:{sheet.cell(max(len(rows) + 1, 1), len(columns)).coordinate}"
+            physical_rows: dict[str, int] = {}
+            for row_index in range(2, sheet.max_row + 1):
+                item_id = workbook_cell_text(sheet.cell(row_index, 1).value).strip()
+                if item_id:
+                    physical_rows[item_id] = row_index
+            column_indexes = {field: index for index, field in enumerate(columns, start=1)}
+            for patch in patches:
+                item_id = patch["item_id"]
+                values = patch["values"]
+                append = bool(patch.get("append"))
+                if append:
+                    if item_id in physical_rows:
+                        fail("추가할 번호가 이미 Excel 탭에 있습니다", item_id=item_id)
+                    row_index = max(physical_rows.values(), default=1) + 1
+                    physical_rows[item_id] = row_index
+                else:
+                    row_index = physical_rows.get(item_id)
+                    if row_index is None:
+                        fail("수정할 번호가 Excel 탭에 없습니다", item_id=item_id)
+                for field, value in values.items():
+                    if field not in column_indexes:
+                        fail("패치 필드가 스키마에 없습니다", field=field)
+                    sheet.cell(row_index, column_indexes[field], value)
+            if sheet.auto_filter.ref and physical_rows:
+                min_col, min_row, max_col, max_row = range_boundaries(sheet.auto_filter.ref)
+                max_row = max(max_row, max(physical_rows.values()))
+                sheet.auto_filter.ref = (
+                    f"{get_column_letter(min_col)}{min_row}:{get_column_letter(max_col)}{max_row}"
+                )
             workbook.save(temporary)
         finally:
             workbook.close()
-        read_workbook_snapshot(temporary, kind, sheet_name)
+        written_rows, _, _ = read_workbook_snapshot(temporary, kind, sheet_name)
+        written_by_id = {row["번호"]: row for row in written_rows}
+        for patch in patches:
+            written = written_by_id.get(patch["item_id"])
+            if written is None:
+                fail("Excel 쓰기 검증에서 대상 행을 찾지 못했습니다", item_id=patch["item_id"])
+            for field, expected in patch["values"].items():
+                if written[field] != workbook_cell_text(expected):
+                    fail(
+                        "Excel 쓰기 검증 결과가 요청과 다릅니다",
+                        item_id=patch["item_id"],
+                        field=field,
+                        expected=workbook_cell_text(expected),
+                        actual=written[field],
+                    )
 
         require_expected_hash(path, expected_sha)
         descriptor = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -494,10 +624,12 @@ def load_profile_store(path: Path) -> dict[str, Any]:
         previous = onboarding.get("previous_active_profile")
         if previous in data["profiles"]:
             data["active_profile"] = previous
+    validate_profile_store(data, path)
     return data
 
 
 def write_profile_store(path: Path, data: dict[str, Any]) -> None:
+    validate_profile_store(data, path)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, raw_temp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     temporary = Path(raw_temp)
@@ -509,6 +641,7 @@ def write_profile_store(path: Path, data: dict[str, Any]) -> None:
             os.fsync(handle.fileno())
         os.chmod(temporary, 0o600)
         os.replace(temporary, path)
+        fsync_directory(path.parent)
     except Exception:
         if temporary.exists():
             temporary.unlink()
@@ -516,6 +649,43 @@ def write_profile_store(path: Path, data: dict[str, Any]) -> None:
 
 
 SHEET_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def validate_profile_store(data: dict[str, Any], path: Path) -> None:
+    if data.get("version") != 1 or not isinstance(data.get("profiles"), dict):
+        fail("프로필 저장소 형식이 올바르지 않습니다", path=str(path))
+    active = data.get("active_profile")
+    if active is not None and (not isinstance(active, str) or active not in data["profiles"]):
+        fail("활성 프로필이 저장소에 없습니다", path=str(path), name=active)
+    for name, profile in data["profiles"].items():
+        if not isinstance(name, str) or not name or not isinstance(profile, dict):
+            fail("프로필 항목 형식이 올바르지 않습니다", path=str(path), name=name)
+        access = profile.get("access")
+        if access not in {"local-xlsx", "google-sheet"}:
+            continue  # 구형 프로필은 show에서 지원 중단 안내를 제공한다.
+        common = ("name", "access", "label", "updated_at", "listing_sheet", "detail_sheet")
+        required = (*common, "workbook_path") if access == "local-xlsx" else (
+            *common,
+            "sheet_id",
+            "spreadsheet_url",
+            "connector",
+            "account",
+        )
+        missing = [field for field in required if not isinstance(profile.get(field), str) or not profile[field].strip()]
+        if missing:
+            fail("프로필 필수 필드가 없습니다", path=str(path), name=name, fields=missing)
+        if profile["name"] != name:
+            fail("프로필 이름과 저장소 키가 다릅니다", path=str(path), name=name)
+        if profile["listing_sheet"] == profile["detail_sheet"]:
+            fail("프로필의 검색용 탭과 상세 탭 이름은 달라야 합니다", path=str(path), name=name)
+        if access == "local-xlsx":
+            workbook_path = Path(profile["workbook_path"])
+            if not workbook_path.is_absolute() or workbook_path.suffix.casefold() != ".xlsx":
+                fail("Excel 프로필 경로는 절대 .xlsx 경로여야 합니다", path=str(path), name=name)
+        else:
+            sheet_id = extract_sheet_id(profile["sheet_id"])
+            if extract_sheet_id(profile["spreadsheet_url"]) != sheet_id:
+                fail("Google 프로필의 시트 ID와 링크가 다릅니다", path=str(path), name=name)
 
 
 def extract_sheet_id(raw: str) -> str:
@@ -529,10 +699,14 @@ def extract_sheet_id(raw: str) -> str:
     return value
 
 
-def profile_view(profile: dict[str, Any]) -> dict[str, Any]:
+def profile_view(profile: dict[str, Any], verify_local: bool = False) -> dict[str, Any]:
     result = dict(profile)
     if profile.get("access") == "local-xlsx":
-        result["workbook_exists"] = Path(profile["workbook_path"]).is_file()
+        workbook_path = Path(profile["workbook_path"])
+        result["workbook_exists"] = workbook_path.is_file()
+        if verify_local:
+            validate_workbook_pair(workbook_path, profile["listing_sheet"], profile["detail_sheet"])
+            result["workbook_valid"] = True
     return result
 
 
@@ -555,8 +729,7 @@ def command_profile(args: argparse.Namespace, store_path: Path) -> dict[str, Any
                     if not args.workbook:
                         fail("local-xlsx 프로필에는 --workbook이 필요합니다")
                     workbook_path = resolve_path(args.workbook)
-                    read_workbook_snapshot(workbook_path, "listing", args.listing_sheet)
-                    read_workbook_snapshot(workbook_path, "detail", args.detail_sheet)
+                    validate_workbook_pair(workbook_path, args.listing_sheet, args.detail_sheet)
                     profile.update(
                         workbook_path=str(workbook_path),
                         listing_sheet=args.listing_sheet,
@@ -591,9 +764,10 @@ def command_profile(args: argparse.Namespace, store_path: Path) -> dict[str, Any
             if args.profile_action == "activate":
                 if args.name not in data["profiles"]:
                     fail("프로필을 찾을 수 없습니다", name=args.name)
+                verified = profile_view(data["profiles"][args.name], verify_local=True)
                 data["active_profile"] = args.name
                 write_profile_store(store_path, data)
-                return {"ok": True, "active_profile": args.name, "profile": profile_view(data["profiles"][args.name])}
+                return {"ok": True, "active_profile": args.name, "profile": verified}
 
     if args.profile_action == "list":
         return {
@@ -616,7 +790,7 @@ def command_profile(args: argparse.Namespace, store_path: Path) -> dict[str, Any
             access=profile.get("access"),
             hint="Google Sheets 또는 로컬 Excel로 매물장을 다시 연결하세요",
         )
-    return {"ok": True, "profile_store": str(store_path), "active_profile": name, "profile": profile_view(profile)}
+    return {"ok": True, "profile_store": str(store_path), "active_profile": name, "profile": profile_view(profile, verify_local=True)}
 
 
 def compare_value(raw: str, criterion: dict[str, Any]) -> bool | None:
@@ -788,9 +962,12 @@ def search_rows(
         else:
             possible.append(decorated)
 
-    # 거래유형이 하드 조건으로 고정되지 않으면 매매가·보증금·월세가 한 축에서 비교돼
-    # 순위가 무의미해진다. 그때는 거래유형끼리 묶어 유형 간 가격 비교를 막는다.
-    group_by_transaction = not any(criterion["field"] == "거래" for criterion in hard)
+    found_transactions = {
+        item["row"]["거래"]
+        for item in [*matches, *possible]
+        if not is_unknown(item["row"]["거래"])
+    }
+    group_by_transaction = len(found_transactions) > 1
 
     def sort_key(item: dict[str, Any]) -> tuple[Any, ...]:
         row = item["row"]
@@ -856,16 +1033,27 @@ def command_search(args: argparse.Namespace) -> dict[str, Any]:
     relaxations = relaxation_counts(rows, hard, args.include_hold)
 
     warnings: list[dict[str, Any]] = []
-    if not any(criterion["field"] == "거래" for criterion in hard):
-        found = sorted({item["row"]["거래"] for item in [*matches, *possible] if not is_unknown(item["row"]["거래"])})
-        if len(found) > 1:
-            warnings.append(
-                {
-                    "warning": "거래유형이 섞여 있어 유형 간 가격 순위는 비교할 수 없습니다",
-                    "transactions": found,
-                    "hint": "거래유형을 하드 조건으로 지정하면 한 유형 안에서 순위를 매깁니다",
-                }
-            )
+    found = sorted(
+        {item["row"]["거래"] for item in [*matches, *possible] if not is_unknown(item["row"]["거래"])},
+        key=lambda transaction: (TRANSACTION_ORDER.get(transaction, len(TRANSACTION_ORDER)), transaction),
+    )
+    if len(found) > 1:
+        warnings.append(
+            {
+                "warning": "거래유형이 섞여 있어 유형 간 가격 순위는 비교할 수 없습니다",
+                "transactions": found,
+                "hint": "한 거래유형만 남도록 조건을 좁히면 유형 안에서만 가격 순위를 매깁니다",
+            }
+        )
+
+    match_status_counts = {
+        status: sum(1 for item in matches if item["row"]["상태"] == status)
+        for status in ("진행", "보류")
+    }
+    verification_status_counts = {
+        status: sum(1 for item in possible if item["row"]["상태"] == status)
+        for status in ("진행", "보류")
+    }
 
     return {
         "ok": True,
@@ -874,6 +1062,8 @@ def command_search(args: argparse.Namespace) -> dict[str, Any]:
         "validated_rows": summary["rows"],
         "matches_count": len(matches),
         "needs_verification_count": len(possible),
+        "match_status_counts": match_status_counts,
+        "verification_status_counts": verification_status_counts,
         "matches": matches[: args.limit],
         "needs_verification": possible[: args.limit],
         "relaxations": relaxations,
@@ -900,14 +1090,33 @@ def duplicate_signatures(row: dict[str, str]) -> list[tuple[str, tuple[str, ...]
     여러 출처(내 장부·단톡방·플랫폼)에서 같은 매물이 들어오는 것이 이 스킬의 정상 입력이므로
     저장을 막지 않고 후보만 알린다. 확정 판정이 아니다.
     """
+    def normalized(field: str, value: str) -> str:
+        text = re.sub(r"\s+", "", str(value)).casefold()
+        if field == "동호":
+            parts = re.findall(r"\d+(?:\.0+)?", text)
+            if len(parts) == 2:
+                return "-".join(format(float(part), ".15g") for part in parts)
+        if field in NUMERIC_FIELDS and not is_unknown(text):
+            try:
+                number = float(text)
+            except ValueError:
+                return text
+            if math.isfinite(number):
+                return format(number, ".15g")
+        return text
+
     signatures: list[tuple[str, tuple[str, ...]]] = []
     complex_name, unit = row["단지명"], row["동호"]
-    if not is_unknown(complex_name) and not is_unknown(unit):
-        signatures.append(("단지·동호", (complex_name.strip().casefold(), unit.strip().casefold())))
-    price_fields = tuple(row[field] for field in ("매매가(만원)", "보증금(만원)", "월세(만원)"))
-    core = (row["지역"], row["동네"], row["거래"], row["전용(㎡)"], *price_fields)
+    if not is_unknown(row["지역"]) and not is_unknown(complex_name) and not is_unknown(unit):
+        signatures.append(
+            (
+                "지역·단지·동호",
+                tuple(normalized(field, row[field]) for field in ("지역", "단지명", "동호")),
+            )
+        )
+    core_fields = ("지역", "동네", "거래", "전용(㎡)", "매매가(만원)", "보증금(만원)", "월세(만원)")
     if all(not is_unknown(value) for value in (row["지역"], row["거래"], row["전용(㎡)"])):
-        signatures.append(("지역·거래·면적·가격", tuple(str(value).strip().casefold() for value in core)))
+        signatures.append(("지역·거래·면적·가격", tuple(normalized(field, row[field]) for field in core_fields)))
     return signatures
 
 
@@ -936,6 +1145,71 @@ def generated_id(rows: list[dict[str, str]]) -> str:
     return f"P{(max(numbers, default=0) + 1):03d}"
 
 
+def prepare_listing_additions(
+    rows: list[dict[str, str]], payload: Any
+) -> tuple[list[dict[str, str]], list[dict[str, Any]], list[dict[str, Any]]]:
+    records = payload if isinstance(payload, list) else [payload]
+    if not records or len(records) > 1000 or any(not isinstance(record, dict) for record in records):
+        fail("매물 JSON은 객체 또는 1~1000개의 객체 배열이어야 합니다")
+    added: list[dict[str, str]] = []
+    warnings: list[dict[str, Any]] = []
+    patches: list[dict[str, Any]] = []
+    for record in records:
+        unknown_fields = sorted(set(record) - set(LISTING_COLUMNS))
+        if unknown_fields:
+            fail("스키마에 없는 컬럼입니다", fields=unknown_fields)
+        row = {column: "?" for column in LISTING_COLUMNS}
+        for field in ("매매가(만원)", "보증금(만원)", "월세(만원)"):
+            row[field] = ""
+        row.update({key: normalize_input_value(key, value) for key, value in record.items()})
+        row["번호"] = row["번호"] if not is_unknown(row["번호"]) else generated_id(rows)
+        if "상태" in record and row["상태"] not in STATUS_VALUES:
+            fail("명시한 상태 값이 올바르지 않습니다", value=row["상태"], allowed=sorted(STATUS_VALUES))
+        missing_core = [field for field in ("종류", "거래", "지역") if is_unknown(row[field])]
+        if missing_core:
+            row["상태"] = "보류"
+            warnings.append({"item_id": row["번호"], "fields": missing_core, "warning": "검색 핵심값 미확인으로 보류"})
+        elif "상태" not in record:
+            row["상태"] = "진행"
+        if "접수일" not in record:
+            row["접수일"] = date.today().isoformat()
+        if any(existing["번호"] == row["번호"] for existing in rows):
+            fail("이미 존재하는 번호입니다", item_id=row["번호"])
+        similar = duplicate_candidates(row, rows)
+        if similar:
+            warnings.append(
+                {
+                    "item_id": row["번호"],
+                    "warning": "같은 물건일 수 있는 기존 매물이 있습니다",
+                    "candidates": similar,
+                }
+            )
+        rows.append(row)
+        added.append(row)
+        patches.append({"item_id": row["번호"], "values": dict(row), "append": True})
+    validate_rows(rows, "listing")
+    return added, warnings, patches
+
+
+def parse_existing_rows_json(raw: str) -> list[dict[str, str]]:
+    payload = parse_json(raw, "기존 매물")
+    if not isinstance(payload, list) or any(not isinstance(row, dict) for row in payload):
+        fail("기존 매물 JSON은 객체 배열이어야 합니다")
+    rows = [
+        {column: workbook_cell_text(row.get(column, "")) for column in LISTING_COLUMNS}
+        for row in payload
+    ]
+    validate_rows(rows, "listing")
+    return rows
+
+
+def command_prepare_add(args: argparse.Namespace) -> dict[str, Any]:
+    rows = parse_existing_rows_json(args.existing_json)
+    payload = parse_json(args.record_json, "매물")
+    added, warnings, _ = prepare_listing_additions(rows, payload)
+    return {"ok": True, "prepared_count": len(added), "prepared": added, "warnings": warnings}
+
+
 def command_mutation(args: argparse.Namespace) -> dict[str, Any]:
     path = resolve_path(args.workbook)
     with file_lock(path):
@@ -947,44 +1221,11 @@ def command_mutation(args: argparse.Namespace) -> dict[str, Any]:
                 expected_sha=args.expected_sha,
                 actual_sha=snapshot_sha,
             )
+        warnings: list[dict[str, Any]] = []
+        patches: list[dict[str, Any]] = []
         if args.command == "add":
             payload = parse_json(args.record_json, "매물")
-            records = payload if isinstance(payload, list) else [payload]
-            if not records or len(records) > 1000 or any(not isinstance(record, dict) for record in records):
-                fail("매물 JSON은 객체 또는 1~1000개의 객체 배열이어야 합니다")
-            added: list[dict[str, str]] = []
-            warnings: list[dict[str, Any]] = []
-            for record in records:
-                unknown_fields = sorted(set(record) - set(LISTING_COLUMNS))
-                if unknown_fields:
-                    fail("스키마에 없는 컬럼입니다", fields=unknown_fields)
-                row = {column: "?" for column in LISTING_COLUMNS}
-                for field in ("매매가(만원)", "보증금(만원)", "월세(만원)"):
-                    row[field] = ""
-                row.update({key: normalize_input_value(key, value) for key, value in record.items()})
-                row["번호"] = row["번호"] if not is_unknown(row["번호"]) else generated_id(rows)
-                if "상태" in record and row["상태"] not in STATUS_VALUES:
-                    fail("명시한 상태 값이 올바르지 않습니다", value=row["상태"], allowed=sorted(STATUS_VALUES))
-                missing_core = [field for field in ("종류", "거래", "지역") if is_unknown(row[field])]
-                if "상태" not in record:
-                    row["상태"] = "보류" if missing_core else "진행"
-                if missing_core:
-                    warnings.append({"item_id": row["번호"], "fields": missing_core, "warning": "검색 핵심값 미확인으로 보류"})
-                if "접수일" not in record:
-                    row["접수일"] = date.today().isoformat()
-                if any(existing["번호"] == row["번호"] for existing in rows):
-                    fail("이미 존재하는 번호입니다", item_id=row["번호"])
-                similar = duplicate_candidates(row, rows)
-                if similar:
-                    warnings.append(
-                        {
-                            "item_id": row["번호"],
-                            "warning": "같은 물건일 수 있는 기존 매물이 있습니다",
-                            "candidates": similar,
-                        }
-                    )
-                rows.append(row)
-                added.append(row)
+            added, warnings, patches = prepare_listing_additions(rows, payload)
             changed = added[0] if isinstance(payload, dict) else added
         else:
             index, current = find_row(rows, args.id)
@@ -993,6 +1234,7 @@ def command_mutation(args: argparse.Namespace) -> dict[str, Any]:
                 if current["상태"] == "완료":
                     fail("이미 완료 상태입니다", item_id=args.id)
                 current["상태"] = "완료"
+                patch_values = {"상태": "완료"}
             else:
                 changes = parse_json(args.changes_json, "변경값")
                 if not isinstance(changes, dict):
@@ -1002,13 +1244,22 @@ def command_mutation(args: argparse.Namespace) -> dict[str, Any]:
                     fail("스키마에 없는 컬럼입니다", fields=unknown_fields)
                 if "번호" in changes:
                     fail("번호는 update로 변경할 수 없습니다")
-                current.update({key: normalize_input_value(key, value) for key, value in changes.items()})
+                patch_values = {key: normalize_input_value(key, value) for key, value in changes.items()}
+                if "상태" in patch_values and patch_values["상태"] not in STATUS_VALUES:
+                    fail("명시한 상태 값이 올바르지 않습니다", value=patch_values["상태"], allowed=sorted(STATUS_VALUES))
+                current.update(patch_values)
+                missing_core = [field for field in ("종류", "거래", "지역") if is_unknown(current[field])]
+                if missing_core:
+                    current["상태"] = "보류"
+                    patch_values["상태"] = "보류"
+                    warnings.append({"item_id": current["번호"], "fields": missing_core, "warning": "검색 핵심값 미확인으로 보류"})
             rows[index] = current
             changed = {"before": before, "after": current}
+            patches.append({"item_id": current["번호"], "values": patch_values, "append": False})
 
-            warnings = []
-
-        backup, new_hash = write_workbook_atomic(path, sheet_name, LISTING_COLUMNS, rows, "listing", args.expected_sha)
+        backup, new_hash = write_workbook_atomic(
+            path, sheet_name, LISTING_COLUMNS, rows, "listing", args.expected_sha, patches
+        )
         return {
             "ok": True,
             **target_metadata(path, sheet_name),
@@ -1030,6 +1281,11 @@ def command_detail_upsert(args: argparse.Namespace) -> dict[str, Any]:
                 expected_sha=args.expected_sha,
                 actual_sha=snapshot_sha,
             )
+        listing_rows, _, listing_sha = read_workbook_snapshot(path, "listing", args.listing_sheet)
+        if listing_sha != snapshot_sha:
+            fail("상세 확인 중 Excel 파일이 변경되었습니다", path=str(path))
+        if not any(row["번호"] == args.id for row in listing_rows):
+            fail("매물 탭에 없는 번호의 상세행은 만들 수 없습니다", item_id=args.id, listing_sheet=args.listing_sheet)
         changes = parse_json(args.changes_json, "상세 변경값")
         if not isinstance(changes, dict):
             fail("상세 변경값 JSON은 객체여야 합니다")
@@ -1048,11 +1304,23 @@ def command_detail_upsert(args: argparse.Namespace) -> dict[str, Any]:
             before = None
         current.update({key: normalize_input_value(key, value) for key, value in changes.items()})
         current["번호"] = args.id
+        append = index == len(rows)
         if index == len(rows):
             rows.append(current)
         else:
             rows[index] = current
-        backup, new_hash = write_workbook_atomic(path, sheet_name, DETAIL_COLUMNS, rows, "detail", args.expected_sha)
+        patch_values = {key: normalize_input_value(key, value) for key, value in changes.items()}
+        if append:
+            patch_values = dict(current)
+        backup, new_hash = write_workbook_atomic(
+            path,
+            sheet_name,
+            DETAIL_COLUMNS,
+            rows,
+            "detail",
+            args.expected_sha,
+            [{"item_id": args.id, "values": patch_values, "append": append}],
+        )
         return {
             "ok": True,
             **target_metadata(path, sheet_name),
@@ -1105,6 +1373,12 @@ def build_parser() -> argparse.ArgumentParser:
     init_workbook.add_argument("--listing-sheet", default="매물")
     init_workbook.add_argument("--detail-sheet", default="매물상세")
 
+    create_excel = subparsers.add_parser("create-excel")
+    create_excel.add_argument("--directory", required=True)
+    create_excel.add_argument("--base-name", default="매물장")
+    create_excel.add_argument("--listing-sheet", default="매물")
+    create_excel.add_argument("--detail-sheet", default="매물상세")
+
     validate = subparsers.add_parser("validate")
     add_table_target(validate)
     validate.add_argument("--kind", choices=["listing", "detail"], required=True)
@@ -1121,6 +1395,10 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("--criteria-json", required=True)
     search.add_argument("--limit", type=int, default=10)
     search.add_argument("--include-hold", action="store_true")
+
+    prepare_add = subparsers.add_parser("prepare-add")
+    prepare_add.add_argument("--existing-json", required=True)
+    prepare_add.add_argument("--record-json", required=True)
 
     add = subparsers.add_parser("add")
     add_workbook_target(add)
@@ -1143,6 +1421,7 @@ def build_parser() -> argparse.ArgumentParser:
     detail.add_argument("--id", required=True)
     detail.add_argument("--changes-json", required=True)
     detail.add_argument("--expected-sha", required=True)
+    detail.add_argument("--listing-sheet", default="매물")
     return parser
 
 
@@ -1152,6 +1431,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         return command_profile(args, store_path)
     if args.command == "init-workbook":
         return command_init_workbook(args)
+    if args.command == "create-excel":
+        return command_create_excel(args, store_path)
     if args.command == "validate":
         path, sheet_name, _, summary, snapshot_sha = read_command_table(args, args.kind)
         return {"ok": True, **target_metadata(path, sheet_name), "kind": args.kind, "sha256": snapshot_sha, **summary}
@@ -1168,6 +1449,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         if args.limit < 1 or args.limit > 100:
             fail("limit은 1부터 100 사이여야 합니다")
         return command_search(args)
+    if args.command == "prepare-add":
+        return command_prepare_add(args)
     if args.command in {"add", "update", "complete"}:
         return command_mutation(args)
     if args.command == "detail-upsert":

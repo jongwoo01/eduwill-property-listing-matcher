@@ -66,7 +66,7 @@ class RankingAndDedupTests(unittest.TestCase):
         order = [item["row"]["거래"] for item in payload["matches"]]
         self.assertEqual(order, ["매매", "전세", "월세"], "거래유형끼리 묶여야 한다")
         self.assertTrue(payload["warnings"], "혼재 경고가 있어야 한다")
-        self.assertEqual(payload["warnings"][0]["transactions"], ["매매", "월세", "전세"])
+        self.assertEqual(payload["warnings"][0]["transactions"], ["매매", "전세", "월세"])
 
     def test_hard_transaction_condition_keeps_single_ranking(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -77,6 +77,20 @@ class RankingAndDedupTests(unittest.TestCase):
             payload = self.search(path, {"hard": [{"field": "거래", "op": "eq", "value": "월세"}], "soft": []})
 
         self.assertEqual(payload["warnings"], [], "단일 거래유형이면 경고가 없어야 한다")
+
+    def test_transaction_in_condition_still_groups_actual_mixed_results(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            path = self.write_csv(Path(raw), [
+                self.base_row(번호="P002", 거래="월세", 보증금="3000", 월세="50"),
+                self.base_row(번호="P001", 거래="전세", 보증금="28000"),
+            ])
+            payload = self.search(path, {
+                "hard": [{"field": "거래", "op": "in", "value": ["전세", "월세"]}],
+                "soft": [],
+            })
+
+        self.assertEqual([item["row"]["거래"] for item in payload["matches"]], ["전세", "월세"])
+        self.assertEqual(payload["warnings"][0]["transactions"], ["전세", "월세"])
 
     # --- 월세는 보증금이 아니라 월세를 먼저 본다 ---------------------------
 
@@ -152,6 +166,26 @@ class RankingAndDedupTests(unittest.TestCase):
             })
 
         self.assertEqual(payload["warnings"], [])
+
+    def test_duplicate_normalizes_numbers_and_whitespace_but_keeps_region(self) -> None:
+        base = {
+            "종류": "아파트", "거래": "매매", "지역": "서울 구로구", "동네": "구로동",
+            "단지명": "교육 용 A단지", "동호": "101동 1001호", "매매가(만원)": "35000.0", "전용(㎡)": "84.0",
+        }
+        with tempfile.TemporaryDirectory() as raw:
+            workbook = Path(raw) / "매물장.xlsx"
+            self.run_tool("init-workbook", "--workbook", str(workbook))
+            self.add(workbook, base)
+            duplicate = self.add(workbook, {
+                **base, "단지명": "교육용a단지", "동호": "101-1001", "매매가(만원)": "35000", "전용(㎡)": "84",
+            })
+            other_region = self.add(workbook, {
+                **base, "지역": "경기 구로구", "단지명": "교육용a단지", "동호": "101-1001",
+                "매매가(만원)": "35000", "전용(㎡)": "84",
+            })
+
+        self.assertTrue(duplicate["warnings"])
+        self.assertEqual(other_region["warnings"], [])
 
 
 if __name__ == "__main__":

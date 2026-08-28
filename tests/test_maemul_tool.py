@@ -1,9 +1,13 @@
 import json
+import os
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill
 
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
@@ -129,6 +133,28 @@ class MaemulToolRegressionTests(unittest.TestCase):
             result = self.run_tool("--profile-store", str(store), "profile", "show", expect_ok=False)
             self.assertIn("지원하지 않는 저장 방식", result.stdout)
 
+    def test_default_profile_store_migrates_legacy_name_without_deleting_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            codex_root = Path(temporary)
+            legacy_store = codex_root / "maemul-matching" / "profiles.json"
+            self.set_google_profile(legacy_store, "기존매물장", SHEET_ID)
+            legacy_before = legacy_store.read_bytes()
+
+            result = subprocess.run(
+                [sys.executable, str(TOOL), "profile", "show"],
+                text=True,
+                capture_output=True,
+                check=False,
+                env={**os.environ, "CODEX_HOME": str(codex_root)},
+            )
+            canonical_store = codex_root / "edwill-property-listing-matcher" / "profiles.json"
+
+            self.assertEqual(0, result.returncode, result.stdout)
+            self.assertEqual("기존매물장", json.loads(result.stdout)["active_profile"])
+            self.assertTrue(canonical_store.is_file())
+            self.assertEqual(legacy_before, legacy_store.read_bytes())
+            self.assertEqual(json.loads(legacy_store.read_text()), json.loads(canonical_store.read_text()))
+
     # --- 로컬 Excel --------------------------------------------------------
 
     def test_local_excel_profile_search_and_incomplete_chat_batch(self) -> None:
@@ -213,6 +239,184 @@ class MaemulToolRegressionTests(unittest.TestCase):
 
             shown = json.loads(self.run_tool("--profile-store", str(store), "profile", "show").stdout)["profile"]
             self.assertTrue(shown["workbook_exists"])
+            self.assertTrue(shown["workbook_valid"])
+
+    def test_core_value_changed_to_unknown_forces_hold_and_warns(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workbook = Path(temporary) / "매물장.xlsx"
+            initialized = json.loads(self.run_tool("init-workbook", "--workbook", str(workbook)).stdout)
+            added = json.loads(self.run_tool(
+                "add", "--workbook", str(workbook), "--expected-sha", initialized["sha256"],
+                "--record-json", json.dumps({"종류": "아파트", "거래": "전세", "지역": "서울"}, ensure_ascii=False),
+            ).stdout)
+            updated = json.loads(self.run_tool(
+                "update", "--workbook", str(workbook), "--id", "P001", "--expected-sha", added["sha256"],
+                "--changes-json", json.dumps({"종류": "?", "상태": "진행"}, ensure_ascii=False),
+            ).stdout)
+
+        self.assertEqual("보류", updated["changed"]["after"]["상태"])
+        self.assertEqual(["종류"], updated["warnings"][0]["fields"])
+
+    def test_orphan_detail_row_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workbook = Path(temporary) / "매물장.xlsx"
+            initialized = json.loads(self.run_tool("init-workbook", "--workbook", str(workbook)).stdout)
+            result = self.run_tool(
+                "detail-upsert", "--workbook", str(workbook), "--id", "P999",
+                "--changes-json", json.dumps({"특약·메모": "고아"}, ensure_ascii=False),
+                "--expected-sha", initialized["sha256"], expect_ok=False,
+            )
+
+        self.assertIn("매물 탭에 없는 번호", result.stdout)
+
+    def test_template_dropdowns_target_actual_yn_columns(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workbook = Path(temporary) / "매물장.xlsx"
+            self.run_tool("init-workbook", "--workbook", str(workbook))
+            book = load_workbook(workbook)
+            try:
+                validations = list(book["매물"].data_validations.dataValidation)
+                ranges = {str(item.sqref): item.formula1 for item in validations}
+            finally:
+                book.close()
+
+        self.assertIn("U2:V1048576", ranges)
+        self.assertNotIn("T2:U1048576", ranges)
+
+    def test_append_extends_standard_filter_without_replacing_its_columns(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workbook = Path(temporary) / "매물장.xlsx"
+            initialized = json.loads(self.run_tool("init-workbook", "--workbook", str(workbook)).stdout)
+            self.run_tool(
+                "add", "--workbook", str(workbook), "--expected-sha", initialized["sha256"],
+                "--record-json", json.dumps({"종류": "아파트", "거래": "전세", "지역": "서울"}, ensure_ascii=False),
+            )
+            book = load_workbook(workbook)
+            try:
+                filter_ref = book["매물"].auto_filter.ref
+            finally:
+                book.close()
+
+        self.assertEqual("A1:AB2", filter_ref)
+
+    def test_profile_rejects_manual_progress_row_with_unknown_core_value(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workbook = root / "매물장.xlsx"
+            store = root / "profiles.json"
+            initialized = json.loads(self.run_tool("init-workbook", "--workbook", str(workbook)).stdout)
+            self.run_tool(
+                "add", "--workbook", str(workbook), "--expected-sha", initialized["sha256"],
+                "--record-json", json.dumps({"종류": "아파트", "거래": "전세", "지역": "서울"}, ensure_ascii=False),
+            )
+            book = load_workbook(workbook)
+            book["매물"]["C2"] = "?"
+            book.save(workbook)
+            book.close()
+            result = self.run_tool(
+                "--profile-store", str(store), "profile", "set", "--name", "손상",
+                "--access", "local-xlsx", "--workbook", str(workbook), expect_ok=False,
+            )
+
+        self.assertIn("상태=보류", result.stdout)
+        self.assertFalse(store.exists())
+
+    def test_profile_rejects_existing_orphan_detail_row(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workbook = root / "매물장.xlsx"
+            store = root / "profiles.json"
+            self.run_tool("init-workbook", "--workbook", str(workbook))
+            book = load_workbook(workbook)
+            detail = book["매물상세"]
+            for column in range(1, 21):
+                detail.cell(2, column, "?")
+            detail["A2"] = "P999"
+            book.save(workbook)
+            book.close()
+            result = self.run_tool(
+                "--profile-store", str(store), "profile", "set", "--name", "고아",
+                "--access", "local-xlsx", "--workbook", str(workbook), expect_ok=False,
+            )
+
+        self.assertIn("상세행", result.stdout)
+        self.assertIn("P999", result.stdout)
+
+    def test_unsupported_transaction_value_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workbook = Path(temporary) / "매물장.xlsx"
+            initialized = json.loads(self.run_tool("init-workbook", "--workbook", str(workbook)).stdout)
+            result = self.run_tool(
+                "add", "--workbook", str(workbook), "--expected-sha", initialized["sha256"],
+                "--record-json", json.dumps({"종류": "아파트", "거래": "전새", "지역": "서울"}, ensure_ascii=False),
+                expect_ok=False,
+            )
+
+        self.assertIn("거래 값이 올바르지 않습니다", result.stdout)
+
+    def test_partial_update_preserves_styles_unchanged_cells_and_extension_formula(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workbook = Path(temporary) / "매물장.xlsx"
+            initialized = json.loads(self.run_tool("init-workbook", "--workbook", str(workbook)).stdout)
+            added = json.loads(self.run_tool(
+                "add", "--workbook", str(workbook), "--expected-sha", initialized["sha256"],
+                "--record-json", json.dumps({
+                    "종류": "아파트", "거래": "전세", "지역": "서울", "보증금(만원)": 50000,
+                }, ensure_ascii=False),
+            ).stdout)
+            book = load_workbook(workbook)
+            sheet = book["매물"]
+            sheet["B2"].fill = PatternFill("solid", fgColor="00FF00")
+            sheet["AC1"] = "사용자열"
+            sheet["AC2"] = "=1+1"
+            book.save(workbook)
+            book.close()
+            current_sha = json.loads(self.run_tool("hash", "--file", str(workbook)).stdout)["sha256"]
+
+            self.run_tool(
+                "update", "--workbook", str(workbook), "--id", "P001", "--expected-sha", current_sha,
+                "--changes-json", json.dumps({"보증금(만원)": 48000}, ensure_ascii=False),
+            )
+            book = load_workbook(workbook, data_only=False)
+            sheet = book["매물"]
+            try:
+                self.assertEqual("0000FF00", sheet["B2"].fill.fgColor.rgb)
+                self.assertEqual("아파트", sheet["C2"].value)
+                self.assertEqual("=1+1", sheet["AC2"].value)
+            finally:
+                book.close()
+
+    def test_create_excel_numbers_file_and_profile_and_preserves_google_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = root / "profiles.json"
+            self.set_google_profile(store, "매물장-2", SHEET_ID)
+            (root / "매물장.xlsx").write_bytes(b"existing")
+
+            created = json.loads(self.run_tool(
+                "--profile-store", str(store), "create-excel", "--directory", str(root),
+            ).stdout)
+            listed = json.loads(self.run_tool("--profile-store", str(store), "profile", "list").stdout)
+
+        self.assertEqual("매물장-3.xlsx", Path(created["workbook"]).name)
+        self.assertEqual("매물장-3", created["profile"]["name"])
+        self.assertEqual("매물장-3", created["active_profile"])
+        self.assertEqual({"매물장-2", "매물장-3"}, {profile["name"] for profile in listed["profiles"]})
+
+    def test_create_excel_failure_keeps_previous_google_profile_active(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = root / "profiles.json"
+            self.set_google_profile(store, "구글매물장", SHEET_ID)
+            failed = self.run_tool(
+                "--profile-store", str(store), "create-excel", "--directory", str(root),
+                "--listing-sheet", "같은탭", "--detail-sheet", "같은탭", expect_ok=False,
+            )
+            shown = json.loads(self.run_tool("--profile-store", str(store), "profile", "show").stdout)
+
+        self.assertNotEqual(0, failed.returncode)
+        self.assertEqual("구글매물장", shown["active_profile"])
+        self.assertEqual(SHEET_ID, shown["profile"]["sheet_id"])
 
     def test_csv_snapshot_is_read_only(self) -> None:
         sample = SKILL_DIR / "assets" / "매물장-샘플.csv"
@@ -224,6 +428,64 @@ class MaemulToolRegressionTests(unittest.TestCase):
         self.assertEqual(sample.read_bytes(), sample.read_bytes())
         mutated = self.run_tool("complete", "--file", str(sample), "--id", "P001", "--expected-sha", "x", expect_ok=False)
         self.assertNotEqual(0, mutated.returncode)
+
+    def test_prepare_add_assigns_stable_ids_and_hold_without_writing(self) -> None:
+        prepared = json.loads(self.run_tool(
+            "prepare-add", "--existing-json", "[]",
+            "--record-json", json.dumps([
+                {"종류": "아파트", "거래": "전세", "지역": "서울", "전용(㎡)": 84},
+                {"종류": "빌라"},
+            ], ensure_ascii=False),
+        ).stdout)
+
+        self.assertEqual(2, prepared["prepared_count"])
+        self.assertEqual(["P001", "P002"], [row["번호"] for row in prepared["prepared"]])
+        self.assertEqual(["진행", "보류"], [row["상태"] for row in prepared["prepared"]])
+        self.assertEqual("P002", prepared["warnings"][0]["item_id"])
+
+    def test_prepare_add_uses_existing_google_rows_for_id_and_duplicate_warning(self) -> None:
+        existing = {
+            "번호": "P007", "상태": "진행", "종류": "아파트", "거래": "매매",
+            "지역": "서울 구로구", "동네": "구로동", "단지명": "교육 용 A단지",
+            "동호": "101동 1001호", "매매가(만원)": "35000.0", "보증금(만원)": "",
+            "월세(만원)": "", "관리비(만원)": "?", "전용(㎡)": "84.0", "방수": "?",
+            "욕실": "?", "층": "?", "총층": "?", "향": "?", "준공": "?",
+            "주차(대)": "?", "반려": "?", "옵션": "?", "입주가능": "?",
+            "인근역": "?", "역도보(분)": "?", "초등학교": "?", "초등도보(분)": "?",
+            "접수일": "2026-08-20",
+        }
+        incoming = {
+            "종류": "아파트", "거래": "매매", "지역": "서울 구로구", "동네": "구로동",
+            "단지명": "교육용a단지", "동호": "101-1001", "매매가(만원)": 35000, "전용(㎡)": 84,
+        }
+        prepared = json.loads(self.run_tool(
+            "prepare-add", "--existing-json", json.dumps([existing], ensure_ascii=False),
+            "--record-json", json.dumps(incoming, ensure_ascii=False),
+        ).stdout)
+
+        self.assertEqual("P008", prepared["prepared"][0]["번호"])
+        self.assertEqual("P007", prepared["warnings"][0]["candidates"][0]["item_id"])
+
+    def test_include_hold_reports_status_counts_separately(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workbook = Path(temporary) / "매물장.xlsx"
+            initialized = json.loads(self.run_tool("init-workbook", "--workbook", str(workbook)).stdout)
+            added = json.loads(self.run_tool(
+                "add", "--workbook", str(workbook), "--expected-sha", initialized["sha256"],
+                "--record-json", json.dumps([
+                    {"종류": "아파트", "거래": "전세", "지역": "서울"},
+                    {"종류": "아파트", "거래": "전세", "지역": "서울", "상태": "보류"},
+                ], ensure_ascii=False),
+            ).stdout)
+            searched = json.loads(self.run_tool(
+                "search", "--workbook", str(workbook), "--include-hold",
+                "--criteria-json", json.dumps({"hard": [{"field": "지역", "op": "contains", "value": "서울"}], "soft": []}, ensure_ascii=False),
+            ).stdout)
+
+        self.assertTrue(added["ok"])
+        self.assertEqual(2, searched["matches_count"])
+        self.assertEqual({"진행": 1, "보류": 1}, searched["match_status_counts"])
+        self.assertEqual({"진행": 0, "보류": 0}, searched["verification_status_counts"])
 
     def test_template_headers_match_tool_schema(self) -> None:
         import csv
