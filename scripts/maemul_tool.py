@@ -717,7 +717,8 @@ def transaction_price(row: dict[str, str]) -> tuple[float, float]:
         return (infinity if is_unknown(row["보증금(만원)"]) else float(row["보증금(만원)"]), 0.0)
     deposit = infinity if is_unknown(row["보증금(만원)"]) else float(row["보증금(만원)"])
     rent = infinity if is_unknown(row["월세(만원)"]) else float(row["월세(만원)"])
-    return deposit, rent
+    # 월세 손님이 먼저 보는 값은 월세다. 보증금은 협상 여지가 큰 편이므로 2차 키로 둔다.
+    return rent, deposit
 
 
 def receipt_rank(row: dict[str, str]) -> int:
@@ -749,6 +750,15 @@ def decorated_row(row: dict[str, str], soft: list[dict[str, Any]], unknown: list
     }
 
 
+TRANSACTION_ORDER = {"매매": 0, "전세": 1, "월세": 2}
+
+
+def transaction_group(row: dict[str, str]) -> tuple[int, str]:
+    """거래유형별 정렬 그룹. 스키마 밖 값은 뒤로 보내되 순서를 결정적으로 유지한다."""
+    transaction = row["거래"]
+    return (TRANSACTION_ORDER.get(transaction, len(TRANSACTION_ORDER)), transaction)
+
+
 def search_rows(
     rows: list[dict[str, str]],
     hard: list[dict[str, Any]],
@@ -769,10 +779,15 @@ def search_rows(
         else:
             possible.append(decorated)
 
+    # 거래유형이 하드 조건으로 고정되지 않으면 매매가·보증금·월세가 한 축에서 비교돼
+    # 순위가 무의미해진다. 그때는 거래유형끼리 묶어 유형 간 가격 비교를 막는다.
+    group_by_transaction = not any(criterion["field"] == "거래" for criterion in hard)
+
     def sort_key(item: dict[str, Any]) -> tuple[Any, ...]:
         row = item["row"]
         price_a, price_b = transaction_price(row)
-        return (-item["soft_score"], price_a, price_b, -receipt_rank(row), row["번호"])
+        group = transaction_group(row) if group_by_transaction else (0, "")
+        return (group, -item["soft_score"], price_a, price_b, -receipt_rank(row), row["번호"])
 
     matches.sort(key=sort_key)
     possible.sort(key=sort_key)
@@ -831,6 +846,18 @@ def command_search(args: argparse.Namespace) -> dict[str, Any]:
 
     relaxations = relaxation_counts(rows, hard, args.include_hold)
 
+    warnings: list[dict[str, Any]] = []
+    if not any(criterion["field"] == "거래" for criterion in hard):
+        found = sorted({item["row"]["거래"] for item in [*matches, *possible] if not is_unknown(item["row"]["거래"])})
+        if len(found) > 1:
+            warnings.append(
+                {
+                    "warning": "거래유형이 섞여 있어 유형 간 가격 순위는 비교할 수 없습니다",
+                    "transactions": found,
+                    "hint": "거래유형을 하드 조건으로 지정하면 한 유형 안에서 순위를 매깁니다",
+                }
+            )
+
     return {
         "ok": True,
         **target_metadata(path, sheet_name),
@@ -841,6 +868,7 @@ def command_search(args: argparse.Namespace) -> dict[str, Any]:
         "matches": matches[: args.limit],
         "needs_verification": possible[: args.limit],
         "relaxations": relaxations,
+        "warnings": warnings,
     }
 
 
@@ -855,6 +883,39 @@ def find_row(rows: list[dict[str, str]], item_id: str) -> tuple[int, dict[str, s
         if row["번호"] == item_id:
             return index, row
     fail("번호에 해당하는 행을 찾을 수 없습니다", item_id=item_id)
+
+
+def duplicate_signatures(row: dict[str, str]) -> list[tuple[str, tuple[str, ...]]]:
+    """같은 물건이 다른 번호로 다시 들어오는 경우를 찾기 위한 지문.
+
+    여러 출처(내 장부·단톡방·플랫폼)에서 같은 매물이 들어오는 것이 이 스킬의 정상 입력이므로
+    저장을 막지 않고 후보만 알린다. 확정 판정이 아니다.
+    """
+    signatures: list[tuple[str, tuple[str, ...]]] = []
+    complex_name, unit = row["단지명"], row["동호"]
+    if not is_unknown(complex_name) and not is_unknown(unit):
+        signatures.append(("단지·동호", (complex_name.strip().casefold(), unit.strip().casefold())))
+    price_fields = tuple(row[field] for field in ("매매가(만원)", "보증금(만원)", "월세(만원)"))
+    core = (row["지역"], row["동네"], row["거래"], row["전용(㎡)"], *price_fields)
+    if all(not is_unknown(value) for value in (row["지역"], row["거래"], row["전용(㎡)"])):
+        signatures.append(("지역·거래·면적·가격", tuple(str(value).strip().casefold() for value in core)))
+    return signatures
+
+
+def duplicate_candidates(row: dict[str, str], rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    incoming = duplicate_signatures(row)
+    if not incoming:
+        return []
+    hits: list[dict[str, str]] = []
+    for existing in rows:
+        if existing["상태"] == "완료":
+            continue
+        existing_signatures = duplicate_signatures(existing)
+        for label, signature in incoming:
+            if any(label == other_label and signature == other for other_label, other in existing_signatures):
+                hits.append({"item_id": existing["번호"], "matched_on": label})
+                break
+    return hits
 
 
 def generated_id(rows: list[dict[str, str]]) -> str:
@@ -904,6 +965,15 @@ def command_mutation(args: argparse.Namespace) -> dict[str, Any]:
                     row["접수일"] = date.today().isoformat()
                 if any(existing["번호"] == row["번호"] for existing in rows):
                     fail("이미 존재하는 번호입니다", item_id=row["번호"])
+                similar = duplicate_candidates(row, rows)
+                if similar:
+                    warnings.append(
+                        {
+                            "item_id": row["번호"],
+                            "warning": "같은 물건일 수 있는 기존 매물이 있습니다",
+                            "candidates": similar,
+                        }
+                    )
                 rows.append(row)
                 added.append(row)
             changed = added[0] if isinstance(payload, dict) else added

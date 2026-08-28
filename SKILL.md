@@ -34,6 +34,7 @@ description: >-
 | 최초 설정·새 매물장 | `references/setup.md` + 선택한 저장 방식 문서 |
 | 검색 | `references/matching-rules.md` + 선택한 저장 방식 문서의 읽기 절차 |
 | 추가·수정·완료 | 선택한 저장 방식 문서의 변경 절차 |
+| 손님에게 보낼 문안 요청 | `references/client-message.md` |
 | 생성·이관·헤더 오류 | `references/sheet-schema.md` + `references/tool-usage.md` |
 | 안내 문구·오류 복구가 필요함 | `references/user-experience.md`의 해당 절만 |
 
@@ -51,6 +52,8 @@ description: >-
   `profile set --activate`다. 기존 이름에 `--replace`를 쓰려면 사용자에게 덮어쓴다는 점을 확인받는다.
 - 파일·폴더·시트 링크나 매물 텍스트만 와도 직전 질문의 답으로 보고 계속한다.
 - 채팅 입력은 한 건과 여러 건 모두 받는다. 아는 값만 기록하고 모르는 값은 `?`, 해당 없는 가격은 빈칸으로 둔다.
+- 여러 출처를 한 매물장에 모으면 같은 물건이 다시 들어올 수 있다. `add` 응답의 `warnings`에 중복 후보가
+  나오면 저장은 그대로 두고 사용자에게 어느 매물과 겹치는지 알린 뒤 정리 여부를 묻는다.
 - `종류·거래·지역` 중 하나라도 없으면 저장을 막지 않고 `상태=보류`로 기록한다. 보류는 기본 검색에서 제외한다.
 - 사용자의 표현이 여러 값으로 갈려 검색이나 계약에 영향을 줄 때만 질문한다. 나머지는 원문을 메모에 보존한다.
 
@@ -62,6 +65,9 @@ description: >-
 4. 하드 조건이 모두 확인된 항목과 값 확인이 필요한 후보를 분리한다.
 5. 상위 3건은 근거를 자세히, 나머지는 합계 10건까지 간단히 보여준다. 개인정보는 제외한다.
 6. `?`가 있는 후보는 확인 전까지 적합하다고 단정하지 않는다.
+7. 결과에 `warnings`가 있으면 사용자에게 함께 전달한다. 거래유형이 섞이면 유형 간 가격 순위는
+   비교할 수 없다는 뜻이므로 순위를 단일 서열처럼 설명하지 않는다.
+8. 사용자가 손님용 문안을 요청하면 `references/client-message.md`를 읽고 만든다.
 
 ## 변경
 
@@ -76,6 +82,7 @@ description: >-
 - `references/google-sheets-workflow.md` — Google 읽기·쓰기
 - `references/excel-workflow.md` — 폴더 기반 Excel 읽기·쓰기
 - `references/matching-rules.md` — 조건과 순위
+- `references/client-message.md` — 손님용 문안 구조와 표현 규칙
 - `references/sheet-schema.md` — 두 탭의 컬럼과 불완전 데이터
 - `references/tool-usage.md` — 프로필·Excel 명령
 - `references/user-experience.md` — 짧은 안내·복구 문구
