@@ -8,8 +8,8 @@ SKILL_DIR = Path(__file__).resolve().parents[1]
 class UserExperienceContractTests(unittest.TestCase):
     def test_skill_reference_links_resolve_and_removed_ux_file_is_not_referenced(self) -> None:
         skill = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
-        self.assertEqual("edwill-property-listing-matcher", SKILL_DIR.name)
-        self.assertIn("name: edwill-property-listing-matcher", skill)
+        self.assertEqual("eduwill-property-listing-matcher", SKILL_DIR.name)
+        self.assertIn("name: eduwill-property-listing-matcher", skill)
         references = set(re.findall(r"references/[a-z0-9-]+\.md", skill))
         self.assertGreaterEqual(len(references), 7)
         for reference in references:
@@ -43,13 +43,13 @@ class UserExperienceContractTests(unittest.TestCase):
         self.assertIn("Google", content)
         self.assertIn("Excel", content)
         self.assertIn('display_name: "손님 맞춤 매물 찾기"', content)
-        self.assertIn("$edwill-property-listing-matcher", content)
+        self.assertIn("$eduwill-property-listing-matcher", content)
         self.assertNotIn("dependencies:", content)
 
     def test_readme_installs_the_matching_github_repository_and_skill_folder(self) -> None:
         readme = (SKILL_DIR / "README.md").read_text(encoding="utf-8")
-        self.assertIn("jongwoo01/edwill-property-listing-matcher.git", readme)
-        self.assertIn("~/.codex/skills/edwill-property-listing-matcher", readme)
+        self.assertIn("jongwoo01/eduwill-property-listing-matcher.git", readme)
+        self.assertIn("~/.codex/skills/eduwill-property-listing-matcher", readme)
 
 
 if __name__ == "__main__":

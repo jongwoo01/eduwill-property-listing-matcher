@@ -1,4 +1,4 @@
-# edwill-property-listing-matcher
+# eduwill-property-listing-matcher
 
 공인중개사의 Google Sheets 또는 로컬 Excel 매물장을 만들고 연결해 매물 추가·수정·검색을 돕는 Codex 스킬입니다.
 손님 조건에 맞는 매물과 값 확인이 필요한 후보를 구분하고, 거래유형별로 결정적으로 정렬합니다.
@@ -22,21 +22,21 @@ Google Drive 플러그인은 Google Sheets 모드에만 필요합니다. 로컬 
 ## 설치
 
 ```bash
-git clone https://github.com/jongwoo01/edwill-property-listing-matcher.git \
-  ~/.codex/skills/edwill-property-listing-matcher
+git clone https://github.com/jongwoo01/eduwill-property-listing-matcher.git \
+  ~/.codex/skills/eduwill-property-listing-matcher
 python3 -m pip install openpyxl
 ```
 
 위 설치 경로가 이미 있으면 먼저 별도 백업하거나 기존 Git 클론에서 업데이트하세요. 이 명령으로 덮어쓰지 마세요.
-설치 후 Codex를 다시 시작하고 `$edwill-property-listing-matcher`로 호출합니다.
+설치 후 Codex를 다시 시작하고 `$eduwill-property-listing-matcher`로 호출합니다.
 
-기존 `maemul-matching` 사용자의 프로필은 처음 실행할 때 새
-`~/.codex/edwill-property-listing-matcher/profiles.json`으로 복사되며, 기존 프로필 파일은 삭제하지 않습니다.
+기존 `edwill-property-listing-matcher` 또는 `maemul-matching` 사용자의 프로필은 처음 실행할 때 새
+`~/.codex/eduwill-property-listing-matcher/profiles.json`으로 복사되며, 기존 프로필 파일은 삭제하지 않습니다.
 
 ## GitHub 배포 단위
 
 이 저장소 루트 전체가 하나의 스킬 패키지입니다. `SKILL.md`만 따로 올리지 말고 `agents`, `assets`, `references`,
-`scripts`, `tests`를 포함한 `edwill-property-listing-matcher` 폴더 전체를 한 GitHub 저장소로 배포합니다.
+`scripts`, `tests`를 포함한 `eduwill-property-listing-matcher` 폴더 전체를 한 GitHub 저장소로 배포합니다.
 
 기존 설치를 업데이트할 때는 설치 폴더에서 다음을 실행합니다.
 

@@ -1,5 +1,5 @@
 ---
-name: edwill-property-listing-matcher
+name: eduwill-property-listing-matcher
 description: >-
   공인중개사의 매물장을 Google Sheets 또는 로컬 Excel(.xlsx)로 만들거나 연결하고, 매물을 추가·수정·완료 처리하며,
   손님 조건으로 검색해 검증된 후보와 확인 필요 후보를 구분한다. 사용자가 매물장 생성·연결·전환, 매물 등록·변경,

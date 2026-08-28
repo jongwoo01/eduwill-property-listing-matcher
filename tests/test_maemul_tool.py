@@ -134,26 +134,27 @@ class MaemulToolRegressionTests(unittest.TestCase):
             self.assertIn("지원하지 않는 저장 방식", result.stdout)
 
     def test_default_profile_store_migrates_legacy_name_without_deleting_it(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            codex_root = Path(temporary)
-            legacy_store = codex_root / "maemul-matching" / "profiles.json"
-            self.set_google_profile(legacy_store, "기존매물장", SHEET_ID)
-            legacy_before = legacy_store.read_bytes()
+        for legacy_name in ("edwill-property-listing-matcher", "maemul-matching"):
+            with self.subTest(legacy_name=legacy_name), tempfile.TemporaryDirectory() as temporary:
+                codex_root = Path(temporary)
+                legacy_store = codex_root / legacy_name / "profiles.json"
+                self.set_google_profile(legacy_store, "기존매물장", SHEET_ID)
+                legacy_before = legacy_store.read_bytes()
 
-            result = subprocess.run(
-                [sys.executable, str(TOOL), "profile", "show"],
-                text=True,
-                capture_output=True,
-                check=False,
-                env={**os.environ, "CODEX_HOME": str(codex_root)},
-            )
-            canonical_store = codex_root / "edwill-property-listing-matcher" / "profiles.json"
+                result = subprocess.run(
+                    [sys.executable, str(TOOL), "profile", "show"],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    env={**os.environ, "CODEX_HOME": str(codex_root)},
+                )
+                canonical_store = codex_root / "eduwill-property-listing-matcher" / "profiles.json"
 
-            self.assertEqual(0, result.returncode, result.stdout)
-            self.assertEqual("기존매물장", json.loads(result.stdout)["active_profile"])
-            self.assertTrue(canonical_store.is_file())
-            self.assertEqual(legacy_before, legacy_store.read_bytes())
-            self.assertEqual(json.loads(legacy_store.read_text()), json.loads(canonical_store.read_text()))
+                self.assertEqual(0, result.returncode, result.stdout)
+                self.assertEqual("기존매물장", json.loads(result.stdout)["active_profile"])
+                self.assertTrue(canonical_store.is_file())
+                self.assertEqual(legacy_before, legacy_store.read_bytes())
+                self.assertEqual(json.loads(legacy_store.read_text()), json.loads(canonical_store.read_text()))
 
     # --- 로컬 Excel --------------------------------------------------------
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic profile, CSV/XLSX search, and safe mutation tool for edwill-property-listing-matcher."""
+"""Deterministic profile, CSV/XLSX search, and safe mutation tool for eduwill-property-listing-matcher."""
 
 from __future__ import annotations
 
@@ -160,10 +160,16 @@ def require_xlsx_path(path: Path) -> None:
 
 def default_profile_store() -> Path:
     codex_root = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser()
-    canonical = (codex_root / "edwill-property-listing-matcher" / "profiles.json").resolve()
-    legacy = (codex_root / "maemul-matching" / "profiles.json").resolve()
-    if not canonical.exists() and legacy.is_file():
-        write_profile_store(canonical, load_profile_store(legacy))
+    canonical = (codex_root / "eduwill-property-listing-matcher" / "profiles.json").resolve()
+    legacy_candidates = (
+        (codex_root / "edwill-property-listing-matcher" / "profiles.json").resolve(),
+        (codex_root / "maemul-matching" / "profiles.json").resolve(),
+    )
+    if not canonical.exists():
+        for legacy in legacy_candidates:
+            if legacy.is_file():
+                write_profile_store(canonical, load_profile_store(legacy))
+                break
     return canonical
 
 
