@@ -91,6 +91,28 @@ class RankingAndDedupTests(unittest.TestCase):
 
         self.assertEqual([item["row"]["번호"] for item in payload["matches"]], ["P002", "P003", "P001"])
 
+    # --- 텍스트 필드에 크기 비교를 걸면 조용히 통과시키지 않는다 -----------
+
+    def test_ordered_operator_on_text_field_is_rejected(self) -> None:
+        sample = SKILL_DIR / "assets" / "매물장-샘플.csv"
+        for operator, value in (("gte", "남"), ("lte", "남"), ("between", ["남", "서"])):
+            with self.subTest(operator=operator):
+                result = self.run_tool(
+                    "search", "--file", str(sample),
+                    "--criteria-json", json.dumps({"hard": [{"field": "향", "op": operator, "value": value}], "soft": []}, ensure_ascii=False),
+                    expect_ok=False,
+                )
+                self.assertNotEqual(result.returncode, 0, "조용히 통과하면 안 된다")
+                self.assertIn("크기 비교", json.loads(result.stdout)["error"]["message"])
+
+    def test_ordered_operator_on_numeric_field_still_works(self) -> None:
+        sample = SKILL_DIR / "assets" / "매물장-샘플.csv"
+        payload = json.loads(self.run_tool(
+            "search", "--file", str(sample),
+            "--criteria-json", json.dumps({"hard": [{"field": "월세(만원)", "op": "lte", "value": 100}], "soft": []}, ensure_ascii=False),
+        ).stdout)
+        self.assertTrue(payload["ok"])
+
     # --- 같은 물건이 다시 들어오면 막지 않고 알린다 ------------------------
 
     def add(self, workbook: Path, record: dict[str, str]) -> dict[str, object]:

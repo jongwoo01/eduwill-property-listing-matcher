@@ -111,6 +111,8 @@ STATUS_VALUES = {"진행", "보류", "완료"}
 YN_UNKNOWN_VALUES = {"Y", "N", "?"}
 UNKNOWN_VALUES = {"", "?"}
 SUPPORTED_OPERATORS = {"eq", "ne", "in", "not-in", "contains", "lte", "gte", "between"}
+# 텍스트 필드에 크기 비교를 걸면 사전순으로 계산돼 조용히 무의미한 결과가 나온다.
+ORDERED_ONLY_OPERATORS = {"lte", "gte", "between"}
 
 DETAIL_SOURCE_ALIASES = {
     "공시가격(만원)": "공시가격",
@@ -688,6 +690,13 @@ def validate_criteria(criteria: dict[str, Any]) -> tuple[list[dict[str, Any]], l
             fail("검색 조건 value는 null일 수 없습니다", criterion=criterion)
         if criterion["field"] in NUMERIC_FIELDS and criterion["op"] == "contains":
             fail("숫자 필드에는 contains를 사용할 수 없습니다", field=criterion["field"])
+        if criterion["field"] not in NUMERIC_FIELDS and criterion["op"] in ORDERED_ONLY_OPERATORS:
+            fail(
+                "텍스트 필드에는 크기 비교 연산자를 사용할 수 없습니다",
+                field=criterion["field"],
+                operator=criterion["op"],
+                hint="eq·ne·in·not-in·contains 중에서 고르세요",
+            )
     return hard, soft
 
 
